@@ -1,0 +1,27 @@
+{
+  "destination": {
+    "host": "imap.destination.com:993",
+    "user": "collector@example.com",
+    "pass": "YOUR_APP_PASSWORD",
+    "security": "ssl",
+    "mark_as_read": true,
+    "skip_verify": false,
+    "report_label": "INBOX/Reports"
+  },
+  "sources": [
+    {
+      "host": "imap.source-one.com:993",
+      "user": "user@example.com",
+      "pass": "SOURCE_PASSWORD",
+      "security": "ssl",
+      "skip_verify": false,
+      "retention_days": 0,
+      "mappings": [
+        {
+          "from": "INBOX",
+          "to": "Archive/Inbox"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,6 @@
+.git
+.gitignore
+data/
+*.db
+*.log
+bridge
