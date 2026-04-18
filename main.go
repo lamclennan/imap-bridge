@@ -61,8 +61,9 @@ type SourceConfig struct {
 }
 
 type FolderMap struct {
-	From string `json:"from"`
-	To   string `json:"to"`
+	From   string   `json:"from"`
+	To     string   `json:"to"`
+	Labels []string `json:"labels,omitempty"`
 }
 
 // ---------- Error log (daily digest) ----------
@@ -407,7 +408,7 @@ func pruneFolder(ctx context.Context, c *client.Client, user, folder string, ret
 
 // syncFolder fetches unseen messages from src, mirrors their \Seen flag, and
 // appends them to the destination label.
-func syncFolder(ctx context.Context, c *client.Client, dest *DestClient, db *sql.DB, user, folder, label string) {
+func syncFolder(ctx context.Context, c *client.Client, dest *DestClient, db *sql.DB, user, folder, to string, labels []string) {
 	key := user + ":" + folder
 
 	var lastUID uint32
@@ -469,6 +470,11 @@ func syncFolder(ctx context.Context, c *client.Client, dest *DestClient, db *sql
 			}
 		}
 
+		// Append any extra IMAP keywords (labels) requested in the mapping.
+		if len(labels) > 0 {
+			destFlags = append(destFlags, labels...)
+		}
+
 		// Fetch full message body using EntireSpecifier for broad server compatibility.
 		section := &imap.BodySectionName{Specifier: imap.EntireSpecifier}
 		bodyCh := make(chan *imap.Message, 1)
@@ -486,7 +492,7 @@ func syncFolder(ctx context.Context, c *client.Client, dest *DestClient, db *sql
 			continue
 		}
 
-		if err := dest.Append(ctx, label, destFlags, literal); err != nil {
+		if err := dest.Append(ctx, to, destFlags, literal); err != nil {
 			errLog.add("append failed for msg %s (%s/%s): %v", id, user, folder, err)
 			continue
 		}
@@ -563,7 +569,7 @@ func runMappings(ctx context.Context, c *client.Client, src SourceConfig, dest *
 				return true
 			}
 
-			syncFolder(ctx, c, dest, db, src.User, m.From, m.To)
+			syncFolder(ctx, c, dest, db, src.User, m.From, m.To, m.Labels)
 
 			if src.RetentionDays > 0 {
 				pruneFolder(ctx, c, src.User, m.From, src.RetentionDays)
@@ -669,6 +675,38 @@ func runReporter(ctx context.Context, dest *DestClient, destConf DestConfig) {
 	}
 }
 
+// ---------- Folder discovery ----------
+
+// logFolderStructure connects to an IMAP server, lists all folders, and logs
+// them in a tree-like format. Called at startup when a source has no mappings
+// defined, so the user can identify the correct folder names via docker logs.
+func logFolderStructure(label, host, security, user, pass, provider, credFile, tokenFile string, skipVerify bool) {
+	c, _, _, err := connectAndLogin(host, security, user, pass, provider, credFile, tokenFile, skipVerify)
+	if err != nil {
+		log.Printf("folder-discovery: could not connect to %s (%s): %v", label, host, err)
+		return
+	}
+	defer c.Logout()
+
+	mailboxes := make(chan *imap.MailboxInfo, 32)
+	done := make(chan error, 1)
+	go func() { done <- c.List("", "*", mailboxes) }()
+
+	var folders []string
+	for mb := range mailboxes {
+		folders = append(folders, mb.Name)
+	}
+	if err := <-done; err != nil {
+		log.Printf("folder-discovery: LIST failed for %s (%s): %v", label, host, err)
+		return
+	}
+
+	log.Printf("folder-discovery: %s (%s) — %d folder(s):", label, user, len(folders))
+	for _, name := range folders {
+		log.Printf("  folder-discovery:   %s", name)
+	}
+}
+
 // ---------- Main ----------
 
 func main() {
@@ -683,6 +721,29 @@ func main() {
 		log.Fatal("config parse failed:", err)
 	}
 	f.Close()
+
+	// Folder discovery: if any source has no mappings, log both that source's
+	// folder list and the destination's folder list, then exit. This lets the
+	// user see exact folder names in docker logs before writing their config.
+	needsDiscovery := false
+	for _, src := range conf.Sources {
+		if len(src.Mappings) == 0 {
+			needsDiscovery = true
+			break
+		}
+	}
+	if needsDiscovery {
+		log.Println("folder-discovery: one or more sources have no mappings — listing folders and exiting")
+		d := conf.Destination
+		logFolderStructure("destination", d.Host, d.Security, d.User, d.Pass, d.Provider, d.CredentialsFile, d.TokenFile, d.SkipVerify)
+		for i, src := range conf.Sources {
+			if len(src.Mappings) == 0 {
+				logFolderStructure(fmt.Sprintf("source[%d]", i), src.Host, src.Security, src.User, src.Pass, src.Provider, src.CredentialsFile, src.TokenFile, src.SkipVerify)
+			}
+		}
+		log.Println("folder-discovery: add mappings to config.json and restart")
+		return
+	}
 
 	if err := os.MkdirAll("./data", 0755); err != nil {
 		log.Fatal("mkdir data:", err)

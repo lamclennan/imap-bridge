@@ -22,7 +22,7 @@
       "mappings": [
         { "from": "INBOX",      "to": "INBOX" },
         { "from": "INBOX/Sent", "to": "[Gmail]/Sent Mail" },
-        { "from": "INBOX/Work", "to": "Work" }
+        { "from": "INBOX/Work", "to": "Work", "labels": ["work-src"] }
       ]
     },
     {
