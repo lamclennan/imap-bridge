@@ -1,10 +1,29 @@
-version: "3.9"
-
 services:
   imap-bridge:
     build: .
     container_name: imap-bridge
     restart: unless-stopped
+
     volumes:
+      # Persistent SQLite state
       - ./data:/app/data
+
+      # Runtime config — edit on the host, restart to apply
       - ./config.json:/app/config.json:ro
+
+      # OAuth2 credentials and cached tokens.
+      # client_secret.json is read-only; token files need write access
+      # so the bridge can persist refreshed tokens.
+      - ./client_secret.json:/app/client_secret.json:ro
+      - ./tokens:/app/tokens
+
+    # Run the OAuth2 first-time authorisation flow interactively:
+    #   docker compose run --rm imap-bridge
+    # This prints an auth URL, accepts the pasted code, and writes the token.
+    # After that, normal `docker compose up -d` works unattended.
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

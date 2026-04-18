@@ -4,11 +4,13 @@ FROM golang:1.21-alpine AS builder
 RUN apk add --no-cache gcc musl-dev
 
 WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+
 COPY . .
 
-RUN go mod tidy && \
-    CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -o bridge main.go
-
+# CGO required for go-sqlite3. Let Docker resolve GOARCH from the build platform.
+RUN CGO_ENABLED=1 go build -ldflags="-s -w" -o bridge main.go
 
 # ---------- Runtime Stage ----------
 FROM alpine:3.20
@@ -20,17 +22,18 @@ WORKDIR /app
 
 COPY --from=builder /app/bridge .
 
-# Create data dir with correct permissions
+# data/          — SQLite state db (persistent volume)
+# config.json    — mounted at runtime via docker-compose volume
+# *.json creds   — client_secret.json and token_*.json mounted at runtime
 RUN mkdir -p /app/data && chown -R appuser:appuser /app
 
 USER appuser
 
 VOLUME ["/app/data"]
 
-# Graceful shutdown support
 STOPSIGNAL SIGTERM
 
-# Optional healthcheck (basic process check)
+# Basic liveness: confirm the bridge process is running
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s \
   CMD pgrep bridge || exit 1
 
