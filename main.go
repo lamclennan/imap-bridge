@@ -17,7 +17,6 @@ import (
 	"time"
 
 	"github.com/emersion/go-imap"
-	idle "github.com/emersion/go-imap-idle"
 	"github.com/emersion/go-imap/client"
 	"github.com/emersion/go-sasl"
 	_ "github.com/mattn/go-sqlite3"
@@ -542,13 +541,11 @@ func monitorSource(ctx context.Context, src SourceConfig, dest *DestClient, db *
 	}
 }
 
-// runMappings runs the sync+idle loop for all folder mappings on an open connection.
+// runMappings runs the sync+polling loop for all folder mappings on an open connection.
 // Returns true if the exit was due to ctx cancellation (clean shutdown),
 // false if the connection broke and a reconnect is needed.
 func runMappings(ctx context.Context, c *client.Client, src SourceConfig, dest *DestClient, db *sql.DB) (cleanExit bool) {
 	defer c.Logout()
-
-	idleClient := idle.NewClient(c)
 
 	for _, m := range src.Mappings {
 		if ctx.Err() != nil {
@@ -575,29 +572,22 @@ func runMappings(ctx context.Context, c *client.Client, src SourceConfig, dest *
 			updates := make(chan client.Update, 10)
 			c.Updates = updates
 
-			stop := make(chan struct{})
-			idleDone := make(chan error, 1)
-			go func() { idleDone <- idleClient.IdleWithFallback(stop, 0) }()
-
 			select {
 			case <-updates:
-				// New mail notification — close IDLE and re-sync.
-				close(stop)
-				<-idleDone
+				// New mail notification — re-sync immediately.
 
 			case <-time.After(10 * time.Minute):
-				close(stop)
-				<-idleDone
 				if err := c.Noop(); err != nil {
 					errLog.add("noop failed on %s: %v — reconnecting", src.Host, err)
 					return false
 				}
 
 			case <-ctx.Done():
-				close(stop)
-				<-idleDone
 				return true
 			}
+
+			// Clear updates channel for next iteration
+			c.Updates = nil
 		}
 	}
 
