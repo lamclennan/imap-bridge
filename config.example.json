@@ -1,27 +1,24 @@
 {
-  "_comment": "Remove _comment fields before use. For Gmail accounts set provider=gmail and omit pass.",
-
   "destination": {
     "host":             "imap.gmail.com:993",
     "user":             "archive@gmail.com",
     "security":         "ssl",
     "provider":         "gmail",
     "credentials_file": "client_secret.json",
-    "token_file":       "token_dest.json",
-    "report_label":     "[Gmail]/All Mail",
-    "skip_verify":      false,
-    "mark_as_read":     false
+    "token_file":       "tokens/token_dest.json",
+    "report_label":     "Bridge/Reports",
+    "skip_verify":      false
   },
 
   "sources": [
     {
-      "_comment":       "Standard IMAP/SSL source",
+      "_note":          "Standard IMAP — retention_days:0 keeps forever",
       "host":           "mail.example.com:993",
       "user":           "user@example.com",
       "pass":           "app-password-here",
       "security":       "ssl",
       "skip_verify":    false,
-      "retention_days": 90,
+      "retention_days": 0,
       "mappings": [
         { "from": "INBOX",      "to": "INBOX" },
         { "from": "INBOX/Sent", "to": "[Gmail]/Sent Mail" },
@@ -29,19 +26,19 @@
       ]
     },
     {
-      "_comment":         "Gmail OAuth2 source — each Gmail account needs its own token_file",
+      "_note":            "Gmail source — 90-day retention on source folders",
       "host":             "imap.gmail.com:993",
       "user":             "you@gmail.com",
       "security":         "ssl",
       "provider":         "gmail",
       "credentials_file": "client_secret.json",
-      "token_file":       "token_src_you.json",
+      "token_file":       "tokens/token_src_you.json",
       "skip_verify":      false,
-      "retention_days":   30,
+      "retention_days":   90,
       "mappings": [
-        { "from": "INBOX",              "to": "INBOX" },
-        { "from": "[Gmail]/Sent Mail",  "to": "[Gmail]/Sent Mail" },
-        { "from": "[Gmail]/All Mail",   "to": "[Gmail]/All Mail" }
+        { "from": "INBOX",             "to": "INBOX" },
+        { "from": "[Gmail]/Sent Mail", "to": "[Gmail]/Sent Mail" },
+        { "from": "[Gmail]/All Mail",  "to": "[Gmail]/All Mail" }
       ]
     }
   ]

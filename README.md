@@ -10,12 +10,15 @@ A resilient IMAP bridge that streams emails from multiple source accounts into a
 
 * **Low Disk Wear** — SQLite in WAL mode, in-memory deduplication cache
 * **OOM Safe** — streams messages (no full buffering)
-* **Connection Efficient** — reuses IMAP connections, exponential backoff with jitter on both source and destination
-* **Destination Retry** — failed appends retry up to 8 times with backoff; connection is re-established automatically
-* **Gmail OAuth2** — XOAUTH2 support for both source and destination Gmail accounts; token refresh is automatic
+* **Read State Mirroring** — `\Seen` flag from source is mirrored to destination on sync
+* **Connection Efficient** — single shared destination connection, exponential backoff with jitter on source and destination
+* **Destination Retry** — failed appends retry up to 8 times with backoff; connection re-established automatically
+* **Gmail OAuth2** — XOAUTH2 for both source and destination; token refresh is automatic
+* **Source Retention** — optional per-source pruning of messages older than N days (`retention_days: 0` keeps forever)
+* **Daily Digest** — error/warning report delivered as an email to a configurable label at 07:00; always arrives unread; repeated errors collapsed with a count
 * **Reliable Sync** — UID-based incremental sync, Message-ID deduplication
 * **Graceful Shutdown** — SIGTERM/SIGINT safe, clean connection teardown
-* **Docker Ready** — non-root container, healthcheck included
+* **Docker Ready** — non-root container, healthcheck, log rotation
 
 ---
 
@@ -26,18 +29,16 @@ A resilient IMAP bridge that streams emails from multiple source accounts into a
 ```bash
 git clone https://github.com/lamclennan/imap-bridge.git
 cd imap-bridge
-mkdir data
+mkdir -p data tokens
 ```
 
 ### 2. Configure
-
-Copy the example and edit it:
 
 ```bash
 cp config.example.json config.json
 ```
 
-**Plain IMAP** — just fill in `host`, `user`, `pass`, `security`:
+**Plain IMAP destination + source:**
 
 ```json
 {
@@ -46,9 +47,8 @@ cp config.example.json config.json
     "user": "collector@domain.com",
     "pass": "app-password",
     "security": "ssl",
-    "mark_as_read": true,
-    "skip_verify": false,
-    "report_label": "INBOX"
+    "report_label": "Bridge/Reports",
+    "skip_verify": false
   },
   "sources": [
     {
@@ -56,7 +56,7 @@ cp config.example.json config.json
       "user": "user@source.com",
       "pass": "password",
       "security": "ssl",
-      "retention_days": 90,
+      "retention_days": 0,
       "mappings": [
         { "from": "INBOX", "to": "INBOX" }
       ]
@@ -74,51 +74,55 @@ cp config.example.json config.json
   "security":         "ssl",
   "provider":         "gmail",
   "credentials_file": "client_secret.json",
-  "token_file":       "token_you.json"
+  "token_file":       "tokens/token_you.json"
 }
 ```
 
-See `config.example.json` for a full example with all fields.
-
 ### 3. Gmail OAuth2 setup (first time only)
 
-1. In [Google Cloud Console](https://console.cloud.google.com/), create a project, enable the **Gmail API**, and create an **OAuth 2.0 Desktop** client credential.
-2. Download the credential as `client_secret.json` and place it alongside `config.json`.
-3. On first run, the bridge prints an authorisation URL. Open it in a browser, grant access, and paste the code back into the terminal.
-4. The token is cached to `token_file` and refreshed automatically — you only do this once per account.
+1. In [Google Cloud Console](https://console.cloud.google.com/), create a project, enable the **Gmail API**, create an **OAuth 2.0 Desktop** credential, and download `client_secret.json` to the project root.
+2. Run the interactive auth flow:
+   ```bash
+   docker compose run --rm imap-bridge
+   ```
+3. Open the printed URL, grant access, paste the code back. Token is written to `tokens/` and refreshed automatically — you only do this once per account.
 
-> Each Gmail account (source or destination) needs its own `token_file` path.
+> Each Gmail account needs its own `token_file` path.
 
-### 4. Run with Docker
+### 4. Run
 
 ```bash
 docker compose up -d
-```
-
-### 5. View logs
-
-```bash
 docker logs -f imap-bridge
 ```
 
 ---
 
-## 🐳 Docker notes
+## ⚙️ Config reference
 
-* Data is stored in `./data/state.db`
-* Place `client_secret.json` and token files in the project root (mounted into the container)
-* WAL mode enabled for SD-card longevity
-* Container runs as non-root user
+| Field | Scope | Description |
+|---|---|---|
+| `host` | source / dest | `hostname:port` |
+| `user` | source / dest | IMAP username / email address |
+| `pass` | source / dest | Password or app password (omit for Gmail) |
+| `security` | source / dest | `ssl` (port 993), `tls` (STARTTLS), `""` (plain) |
+| `skip_verify` | source / dest | Skip TLS cert check — dev/testing only |
+| `provider` | source / dest | `"gmail"` to use OAuth2 instead of password |
+| `credentials_file` | source / dest | Path to Google OAuth2 `client_secret.json` |
+| `token_file` | source / dest | Path to cached OAuth2 token (unique per account) |
+| `report_label` | dest only | Folder for daily error digest; empty = disabled |
+| `retention_days` | source only | Prune source messages older than N days; `0` = keep forever |
+| `mappings` | source only | `[{ "from": "...", "to": "..." }]` folder pairs |
 
 ---
 
 ## 🔐 Security tips
 
 * Use **app passwords** for non-Gmail IMAP accounts
-* Use **OAuth2** (not passwords) for Gmail — Google blocks plain IMAP auth for most accounts
+* Use **OAuth2** for Gmail — Google blocks plain IMAP auth for most accounts
+* Set `chmod 600` on `client_secret.json` and all token files
 * Avoid `skip_verify: true` in production
-* Set `chmod 600` on `client_secret.json` and token files
-* Consider Docker secrets for sensitive values
+* Consider Docker secrets for `pass` values
 
 ---
 
@@ -126,46 +130,38 @@ docker logs -f imap-bridge
 
 1. Connects to each source IMAP account (password or OAuth2)
 2. Tracks the last seen UID per folder in SQLite
-3. On new mail (IMAP IDLE or 10-minute poll), streams new messages to the destination
-4. Deduplicates using Message-ID — in-memory cache backed by SQLite
-5. Destination appends are retried with backoff on any connection or server error
+3. On new mail (IMAP IDLE or 10-minute poll), fetches new messages
+4. Mirrors `\Seen` flag from source — read mail stays read on the destination
+5. Appends to the mapped destination folder; retries with backoff on failure
+6. Optionally prunes source messages older than `retention_days` after each sync
+7. Delivers a daily digest email at 07:00 with any errors or warnings (collapsed duplicates)
 
 ---
 
-## ⚙️ Config reference
+## 🐳 Docker notes
 
-| Field | Where | Description |
-|---|---|---|
-| `host` | source / dest | `hostname:port` |
-| `user` | source / dest | IMAP username / email address |
-| `pass` | source / dest | Password or app password (omit for Gmail) |
-| `security` | source / dest | `ssl` (port 993), `tls` (STARTTLS), or `""` (plain) |
-| `skip_verify` | source / dest | Skip TLS certificate check (dev only) |
-| `provider` | source / dest | `"gmail"` to use OAuth2 instead of password |
-| `credentials_file` | source / dest | Path to Google OAuth2 `client_secret.json` |
-| `token_file` | source / dest | Path to cached OAuth2 token (unique per account) |
-| `mark_as_read` | dest only | Mark appended messages as read |
-| `report_label` | dest only | Default destination folder |
-| `retention_days` | source only | Reserved for future pruning logic |
-| `mappings` | source only | Array of `{ "from": "...", "to": "..." }` folder mappings |
+* SQLite state in `./data/state.db` (persistent volume)
+* `config.json`, `client_secret.json`, and `tokens/` mounted from project root
+* Log rotation: 10 MB × 3 files
+* Non-root user inside container
 
 ---
 
 ## 🚧 Limitations
 
-* Relies on Message-ID (not always guaranteed unique)
+* Relies on Message-ID for deduplication — not always guaranteed unique
+* OAuth2 first-run requires terminal access to the host
 * SQLite limits horizontal scaling
-* OAuth2 first-run authorisation requires terminal access to the host
 
 ---
 
 ## 🛣️ Roadmap ideas
 
-* [ ] Disk-backed retry queue
-* [ ] Prometheus metrics
+* [ ] Disk-backed retry queue for exhausted append attempts
+* [ ] Prometheus metrics endpoint
 * [ ] Config hot reload (SIGHUP)
 * [ ] Message hashing fallback for missing Message-ID
-* [ ] Non-interactive OAuth2 flow (service account / device flow)
+* [ ] Non-interactive OAuth2 device flow
 
 ---
 

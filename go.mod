@@ -1,7 +1,7 @@
 module github.com/lamclennan/imap-bridge
- 
-go 1.21
- 
+
+go 1.19
+
 require (
 	github.com/emersion/go-imap v1.2.1
 	github.com/emersion/go-imap-idle v0.0.0-20210907174835-1b526e9f57d8
@@ -9,7 +9,7 @@ require (
 	github.com/mattn/go-sqlite3 v1.14.22
 	golang.org/x/oauth2 v0.21.0
 )
- 
+
 require (
 	cloud.google.com/go/compute/metadata v0.3.0 // indirect
 	github.com/emersion/go-message v0.18.1 // indirect

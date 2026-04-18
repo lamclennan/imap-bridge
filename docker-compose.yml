@@ -8,19 +8,19 @@ services:
       # Persistent SQLite state
       - ./data:/app/data
 
-      # Runtime config — edit on the host, restart to apply
+      # Runtime config — edit on the host, restart container to apply
       - ./config.json:/app/config.json:ro
 
-      # OAuth2 credentials and cached tokens.
-      # client_secret.json is read-only; token files need write access
-      # so the bridge can persist refreshed tokens.
+      # OAuth2 client credentials (read-only)
       - ./client_secret.json:/app/client_secret.json:ro
+
+      # Token cache — writable so the bridge can persist refreshed tokens
       - ./tokens:/app/tokens
 
     # Run the OAuth2 first-time authorisation flow interactively:
     #   docker compose run --rm imap-bridge
-    # This prints an auth URL, accepts the pasted code, and writes the token.
-    # After that, normal `docker compose up -d` works unattended.
+    # This prints an auth URL, accepts the pasted code, and writes the token
+    # to ./tokens/. After that, normal `docker compose up -d` runs unattended.
 
     logging:
       driver: json-file

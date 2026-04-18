@@ -33,7 +33,6 @@ VOLUME ["/app/data"]
 
 STOPSIGNAL SIGTERM
 
-# Basic liveness: confirm the bridge process is running
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s \
   CMD pgrep bridge || exit 1
 

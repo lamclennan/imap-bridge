@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"database/sql"
@@ -36,11 +37,10 @@ type DestConfig struct {
 	User        string `json:"user"`
 	Pass        string `json:"pass"`
 	Security    string `json:"security"`
-	ReportLabel string `json:"report_label"`
+	ReportLabel string `json:"report_label"` // folder for daily digest; empty = disabled
 	SkipVerify  bool   `json:"skip_verify"`
-	MarkAsRead  bool   `json:"mark_as_read"`
 
-	// Gmail OAuth2 — set provider:"gmail" and supply these instead of pass.
+	// Gmail OAuth2
 	Provider        string `json:"provider"`
 	CredentialsFile string `json:"credentials_file"`
 	TokenFile       string `json:"token_file"`
@@ -52,7 +52,7 @@ type SourceConfig struct {
 	Pass          string      `json:"pass"`
 	Security      string      `json:"security"`
 	SkipVerify    bool        `json:"skip_verify"`
-	RetentionDays int         `json:"retention_days"`
+	RetentionDays int         `json:"retention_days"` // 0 = keep forever, >0 = prune after N days
 	Mappings      []FolderMap `json:"mappings"`
 
 	// Gmail OAuth2
@@ -66,7 +66,50 @@ type FolderMap struct {
 	To   string `json:"to"`
 }
 
-// ---------- In-memory cache ----------
+// ---------- Error log (daily digest) ----------
+
+type errorEntry struct {
+	ts    time.Time
+	msg   string
+	count int
+}
+
+type errorLog struct {
+	mu      sync.Mutex
+	entries []*errorEntry
+	index   map[string]*errorEntry // keyed by msg for deduplication
+}
+
+// add records a message in the digest buffer and writes it to stdout.
+// Identical repeated messages increment a counter rather than adding new lines.
+func (e *errorLog) add(format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	log.Println(msg)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if existing, ok := e.index[msg]; ok {
+		existing.count++
+		existing.ts = time.Now()
+		return
+	}
+	entry := &errorEntry{ts: time.Now(), msg: msg, count: 1}
+	e.entries = append(e.entries, entry)
+	e.index[msg] = entry
+}
+
+// drain returns all collected entries and resets the buffer.
+func (e *errorLog) drain() []*errorEntry {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := e.entries
+	e.entries = nil
+	e.index = make(map[string]*errorEntry)
+	return out
+}
+
+var errLog = &errorLog{index: make(map[string]*errorEntry)}
+
+// ---------- In-memory dedup cache ----------
 
 type cacheEntry struct {
 	ts time.Time
@@ -131,49 +174,37 @@ func backoff(attempt int) time.Duration {
 
 // ---------- OAuth2 ----------
 
-// loadOAuthToken reads a cached token from disk, or runs the interactive
-// consent flow once to obtain one and saves it for future runs.
 func loadOAuthToken(credFile, tokenFile string) (*oauth2.Token, *oauth2.Config, error) {
 	b, err := os.ReadFile(credFile)
 	if err != nil {
 		return nil, nil, fmt.Errorf("read credentials %q: %w", credFile, err)
 	}
-
 	cfg, err := google.ConfigFromJSON(b, "https://mail.google.com/")
 	if err != nil {
 		return nil, nil, fmt.Errorf("parse credentials: %w", err)
 	}
-
-	// Use cached token if present and parseable.
 	if data, err := os.ReadFile(tokenFile); err == nil {
 		var tok oauth2.Token
 		if json.Unmarshal(data, &tok) == nil {
 			return &tok, cfg, nil
 		}
 	}
-
-	// First-run interactive flow.
 	authURL := cfg.AuthCodeURL("state-token", oauth2.AccessTypeOffline)
 	fmt.Printf("\nOpen this URL to authorise Gmail access:\n%s\n\nPaste the code: ", authURL)
-
 	var code string
 	if _, err := fmt.Scan(&code); err != nil {
 		return nil, nil, fmt.Errorf("read auth code: %w", err)
 	}
-
 	tok, err := cfg.Exchange(context.Background(), code)
 	if err != nil {
 		return nil, nil, fmt.Errorf("token exchange: %w", err)
 	}
-
 	if data, err := json.Marshal(tok); err == nil {
 		_ = os.WriteFile(tokenFile, data, 0600)
 	}
-
 	return tok, cfg, nil
 }
 
-// freshAccessToken refreshes the token if expired and persists the new one.
 func freshAccessToken(cfg *oauth2.Config, tok *oauth2.Token, tokenFile string) (string, *oauth2.Token, error) {
 	if !tok.Valid() {
 		newTok, err := cfg.TokenSource(context.Background(), tok).Token()
@@ -190,7 +221,6 @@ func freshAccessToken(cfg *oauth2.Config, tok *oauth2.Token, tokenFile string) (
 
 // ---------- Connection ----------
 
-// dial opens a raw IMAP connection (SSL, STARTTLS, or plain).
 func dial(host, security string, skipVerify bool) (*client.Client, error) {
 	tlsCfg := &tls.Config{InsecureSkipVerify: skipVerify}
 	switch strings.ToLower(security) {
@@ -211,18 +241,14 @@ func dial(host, security string, skipVerify bool) (*client.Client, error) {
 	}
 }
 
-// connectAndLogin dials and authenticates, supporting both password and Gmail OAuth2.
-// Returns the connected client plus (optionally) the oauth config and token for later refresh.
 func connectAndLogin(
 	host, security, user, pass, provider, credFile, tokenFile string,
 	skipVerify bool,
 ) (*client.Client, *oauth2.Config, *oauth2.Token, error) {
-
 	c, err := dial(host, security, skipVerify)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-
 	if strings.ToLower(provider) == "gmail" {
 		tok, cfg, err := loadOAuthToken(credFile, tokenFile)
 		if err != nil {
@@ -234,14 +260,12 @@ func connectAndLogin(
 			c.Logout()
 			return nil, nil, nil, err
 		}
-		saslClient := sasl.NewXoauth2Client(user, accessToken)
-		if err := c.Authenticate(saslClient); err != nil {
+		if err := c.Authenticate(sasl.NewXoauth2Client(user, accessToken)); err != nil {
 			c.Logout()
 			return nil, nil, nil, fmt.Errorf("gmail xoauth2: %w", err)
 		}
 		return c, cfg, tok, nil
 	}
-
 	if err := c.Login(user, pass); err != nil {
 		c.Logout()
 		return nil, nil, nil, err
@@ -253,8 +277,8 @@ func connectAndLogin(
 
 const maxDestAttempts = 8
 
-// DestClient holds a persistent, auto-reconnecting IMAP append connection.
-// Append failures are retried with exponential backoff.
+// DestClient is a single shared, thread-safe IMAP append connection with
+// automatic reconnection. All source workers and the reporter use the same instance.
 type DestClient struct {
 	conf DestConfig
 
@@ -264,7 +288,6 @@ type DestClient struct {
 	oauthTok *oauth2.Token
 }
 
-// redial (re)establishes the connection. Caller must hold mu.
 func (d *DestClient) redial() error {
 	if d.c != nil {
 		_ = d.c.Logout()
@@ -279,13 +302,10 @@ func (d *DestClient) redial() error {
 	if err != nil {
 		return err
 	}
-	d.c = c
-	d.oauthCfg = oCfg
-	d.oauthTok = oTok
+	d.c, d.oauthCfg, d.oauthTok = c, oCfg, oTok
 	return nil
 }
 
-// ensureConn dials if there is no live connection. Caller must hold mu.
 func (d *DestClient) ensureConn() error {
 	if d.c != nil {
 		return nil
@@ -293,13 +313,10 @@ func (d *DestClient) ensureConn() error {
 	return d.redial()
 }
 
-// Append delivers a message to label, retrying on any transient failure.
-func (d *DestClient) Append(ctx context.Context, label string, r imap.Literal) error {
-	flags := []string{}
-	if d.conf.MarkAsRead {
-		flags = []string{imap.SeenFlag}
-	}
-
+// Append delivers r to label with flags, retrying with exponential backoff.
+// flags should reflect the source message's read state (\Seen or empty).
+// Pass an explicit empty slice []string{} to force delivery as unread.
+func (d *DestClient) Append(ctx context.Context, label string, flags []string, r imap.Literal) error {
 	for attempt := 0; attempt < maxDestAttempts; attempt++ {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -310,7 +327,7 @@ func (d *DestClient) Append(ctx context.Context, label string, r imap.Literal) e
 		if connErr != nil {
 			d.mu.Unlock()
 			wait := backoff(attempt)
-			log.Printf("dest connect error (attempt %d/%d): %v — retry in %s",
+			errLog.add("dest connect error (attempt %d/%d): %v — retry in %s",
 				attempt+1, maxDestAttempts, connErr, wait)
 			select {
 			case <-time.After(wait):
@@ -322,7 +339,6 @@ func (d *DestClient) Append(ctx context.Context, label string, r imap.Literal) e
 
 		appendErr := d.c.Append(label, flags, time.Now(), r)
 		if appendErr != nil {
-			// Invalidate so ensureConn re-dials next iteration.
 			_ = d.c.Logout()
 			d.c = nil
 		}
@@ -333,7 +349,7 @@ func (d *DestClient) Append(ctx context.Context, label string, r imap.Literal) e
 		}
 
 		wait := backoff(attempt)
-		log.Printf("dest append error (attempt %d/%d): %v — retry in %s",
+		errLog.add("dest append error (attempt %d/%d): %v — retry in %s",
 			attempt+1, maxDestAttempts, appendErr, wait)
 		select {
 		case <-time.After(wait):
@@ -345,9 +361,54 @@ func (d *DestClient) Append(ctx context.Context, label string, r imap.Literal) e
 	return fmt.Errorf("dest: exhausted %d attempts appending to %q", maxDestAttempts, label)
 }
 
+// ---------- Retention pruner ----------
+
+// pruneFolder marks messages older than retentionDays as \Deleted and expunges them.
+// No-op when retentionDays is 0. Called on source folders only, never destination.
+func pruneFolder(ctx context.Context, c *client.Client, user, folder string, retentionDays int) {
+	if retentionDays <= 0 || ctx.Err() != nil {
+		return
+	}
+
+	cutoff := time.Now().AddDate(0, 0, -retentionDays)
+
+	criteria := imap.NewSearchCriteria()
+	criteria.Before = cutoff
+
+	uids, err := c.UidSearch(criteria)
+	if err != nil {
+		errLog.add("retention search failed on %s/%s: %v", user, folder, err)
+		return
+	}
+	if len(uids) == 0 {
+		return
+	}
+
+	set := new(imap.SeqSet)
+	for _, uid := range uids {
+		set.AddNum(uid)
+	}
+
+	storeItem := imap.FormatFlagsOp(imap.AddFlags, true)
+	if err := c.UidStore(set, storeItem, []interface{}{imap.DeletedFlag}, nil); err != nil {
+		errLog.add("retention flag failed on %s/%s: %v", user, folder, err)
+		return
+	}
+
+	if err := c.Expunge(nil); err != nil {
+		errLog.add("retention expunge failed on %s/%s: %v", user, folder, err)
+		return
+	}
+
+	log.Printf("retention: pruned %d message(s) older than %d days from %s/%s",
+		len(uids), retentionDays, user, folder)
+}
+
 // ---------- Sync ----------
 
-func syncFolder(ctx context.Context, src *client.Client, dest *DestClient, db *sql.DB, user, folder, label string) {
+// syncFolder fetches unseen messages from src, mirrors their \Seen flag, and
+// appends them to the destination label.
+func syncFolder(ctx context.Context, c *client.Client, dest *DestClient, db *sql.DB, user, folder, label string) {
 	key := user + ":" + folder
 
 	var lastUID uint32
@@ -360,9 +421,9 @@ func syncFolder(ctx context.Context, src *client.Client, dest *DestClient, db *s
 		criteria.Uid = set
 	}
 
-	uids, err := src.UidSearch(criteria)
+	uids, err := c.UidSearch(criteria)
 	if err != nil {
-		log.Println("UID search error:", err)
+		errLog.add("UID search error on %s/%s: %v", user, folder, err)
 		return
 	}
 
@@ -372,7 +433,6 @@ func syncFolder(ctx context.Context, src *client.Client, dest *DestClient, db *s
 		if ctx.Err() != nil {
 			return
 		}
-
 		if uid > maxUID {
 			maxUID = uid
 		}
@@ -380,9 +440,9 @@ func syncFolder(ctx context.Context, src *client.Client, dest *DestClient, db *s
 		set := new(imap.SeqSet)
 		set.AddNum(uid)
 
-		// Fetch envelope to get Message-ID cheaply.
+		// Fetch envelope and flags in one round trip.
 		envCh := make(chan *imap.Message, 1)
-		go src.UidFetch(set, []imap.FetchItem{imap.FetchEnvelope}, envCh)
+		go c.UidFetch(set, []imap.FetchItem{imap.FetchEnvelope, imap.FetchFlags}, envCh)
 		msg := <-envCh
 
 		if msg == nil || msg.Envelope == nil {
@@ -401,19 +461,35 @@ func syncFolder(ctx context.Context, src *client.Client, dest *DestClient, db *s
 			continue
 		}
 
-		// Fetch full RFC822 body.
-		section := &imap.BodySectionName{BodyPartName: imap.RFC822Name}
+		// Mirror \Seen from source to destination.
+		destFlags := []string{}
+		for _, f := range msg.Flags {
+			if f == imap.SeenFlag {
+				destFlags = append(destFlags, imap.SeenFlag)
+				break
+			}
+		}
+
+		// Fetch full message body using EntireSpecifier for broad server compatibility.
+		section := &imap.BodySectionName{Specifier: imap.EntireSpecifier}
 		bodyCh := make(chan *imap.Message, 1)
-		go src.UidFetch(set, []imap.FetchItem{section.FetchItem()}, bodyCh)
+		go c.UidFetch(set, []imap.FetchItem{section.FetchItem()}, bodyCh)
 		body := <-bodyCh
 
 		if body == nil {
+			errLog.add("nil fetch response for uid %d in %s/%s", uid, user, folder)
 			continue
 		}
 
-		if err := dest.Append(ctx, label, body.GetReader(section)); err != nil {
-			log.Printf("append failed for msg %s: %v", id, err)
-			continue // skip this message this cycle; it will be retried next sync
+		literal := body.GetBody(section)
+		if literal == nil {
+			errLog.add("nil body literal for uid %d in %s/%s", uid, user, folder)
+			continue
+		}
+
+		if err := dest.Append(ctx, label, destFlags, literal); err != nil {
+			errLog.add("append failed for msg %s (%s/%s): %v", id, user, folder, err)
+			continue
 		}
 
 		_, _ = db.Exec("INSERT INTO sync_state (msgid) VALUES (?)", id)
@@ -427,8 +503,10 @@ func syncFolder(ctx context.Context, src *client.Client, dest *DestClient, db *s
 
 // ---------- Source worker ----------
 
-func monitorSource(ctx context.Context, src SourceConfig, destConf DestConfig, db *sql.DB) {
-	dest := &DestClient{conf: destConf}
+// monitorSource manages the full lifecycle for one source account.
+// Connects, syncs all mappings, watches for new mail, reconnects on failure.
+// No goto — uses a clean helper function for the connected phase.
+func monitorSource(ctx context.Context, src SourceConfig, dest *DestClient, db *sql.DB) {
 	attempt := 0
 
 	for {
@@ -443,7 +521,7 @@ func monitorSource(ctx context.Context, src SourceConfig, destConf DestConfig, d
 		)
 		if err != nil {
 			wait := backoff(attempt)
-			log.Printf("source connect failed (%s, attempt %d): %v — retry in %s",
+			errLog.add("source connect failed (%s, attempt %d): %v — retry in %s",
 				src.Host, attempt+1, err, wait)
 			select {
 			case <-time.After(wait):
@@ -456,63 +534,148 @@ func monitorSource(ctx context.Context, src SourceConfig, destConf DestConfig, d
 
 		attempt = 0
 		log.Printf("source connected: %s (%s)", src.Host, src.User)
-		idleClient := idle.NewClient(c)
 
-		for _, m := range src.Mappings {
-			if ctx.Err() != nil {
-				c.Logout()
-				return
-			}
+		if cleanExit := runMappings(ctx, c, src, dest, db); cleanExit {
+			return
+		}
+		log.Printf("connection lost to %s — reconnecting", src.Host)
+	}
+}
 
-			if _, err := c.Select(m.From, true); err != nil {
-				log.Printf("select %q failed: %v — reconnecting", m.From, err)
-				c.Logout()
-				goto reconnect
-			}
+// runMappings runs the sync+idle loop for all folder mappings on an open connection.
+// Returns true if the exit was due to ctx cancellation (clean shutdown),
+// false if the connection broke and a reconnect is needed.
+func runMappings(ctx context.Context, c *client.Client, src SourceConfig, dest *DestClient, db *sql.DB) (cleanExit bool) {
+	defer c.Logout()
 
-		idleLoop:
-			for {
-				if ctx.Err() != nil {
-					c.Logout()
-					return
-				}
+	idleClient := idle.NewClient(c)
 
-				syncFolder(ctx, c, dest, db, src.User, m.From, m.To)
-
-				updates := make(chan client.Update, 10)
-				c.Updates = updates
-
-				stop := make(chan struct{})
-				idleDone := make(chan error, 1)
-				go func() { idleDone <- idleClient.IdleWithFallback(stop, 0) }()
-
-				select {
-				case <-updates:
-					close(stop)
-					<-idleDone
-
-				case <-time.After(10 * time.Minute):
-					close(stop)
-					<-idleDone
-					if err := c.Noop(); err != nil {
-						log.Printf("noop failed on %s — reconnecting: %v", src.Host, err)
-						c.Logout()
-						goto reconnect
-					}
-
-				case <-ctx.Done():
-					close(stop)
-					<-idleDone
-					c.Logout()
-					return
-				}
-
-				_ = idleLoop
-			}
+	for _, m := range src.Mappings {
+		if ctx.Err() != nil {
+			return true
 		}
 
-	reconnect:
-		log.Printf("reconnecting source: %s", src.Host)
+		// Select read-write (false) so pruneFolder can expunge if needed.
+		if _, err := c.Select(m.From, false); err != nil {
+			errLog.add("select %q failed on %s: %v — reconnecting", m.From, src.Host, err)
+			return false
+		}
+
+		for {
+			if ctx.Err() != nil {
+				return true
+			}
+
+			syncFolder(ctx, c, dest, db, src.User, m.From, m.To)
+
+			if src.RetentionDays > 0 {
+				pruneFolder(ctx, c, src.User, m.From, src.RetentionDays)
+			}
+
+			updates := make(chan client.Update, 10)
+			c.Updates = updates
+
+			stop := make(chan struct{})
+			idleDone := make(chan error, 1)
+			go func() { idleDone <- idleClient.IdleWithFallback(stop, 0) }()
+
+			select {
+			case <-updates:
+				// New mail notification — close IDLE and re-sync.
+				close(stop)
+				<-idleDone
+
+			case <-time.After(10 * time.Minute):
+				close(stop)
+				<-idleDone
+				if err := c.Noop(); err != nil {
+					errLog.add("noop failed on %s: %v — reconnecting", src.Host, err)
+					return false
+				}
+
+			case <-ctx.Done():
+				close(stop)
+				<-idleDone
+				return true
+			}
+		}
+	}
+
+	return true
+}
+
+// ---------- Report ----------
+
+// buildReportEmail constructs a minimal plain-text RFC 5322 digest.
+// Always delivered unread regardless of any config setting.
+func buildReportEmail(destUser string, entries []*errorEntry) imap.Literal {
+	now := time.Now()
+	var b strings.Builder
+
+	b.WriteString("From: IMAP Bridge <bridge@localhost>\r\n")
+	b.WriteString(fmt.Sprintf("To: %s\r\n", destUser))
+	b.WriteString(fmt.Sprintf("Subject: [imap-bridge] Daily report — %s\r\n", now.Format("2006-01-02")))
+	b.WriteString(fmt.Sprintf("Date: %s\r\n", now.Format(time.RFC1123Z)))
+	b.WriteString("Content-Type: text/plain; charset=utf-8\r\n")
+	b.WriteString("MIME-Version: 1.0\r\n")
+	b.WriteString("\r\n")
+
+	if len(entries) == 0 {
+		b.WriteString("No errors or warnings in the past 24 hours.\r\n")
+		b.WriteString("All sources are syncing cleanly.\r\n")
+	} else {
+		b.WriteString(fmt.Sprintf("%d distinct issue(s) in the past 24 hours:\r\n\r\n", len(entries)))
+		for _, e := range entries {
+			if e.count == 1 {
+				b.WriteString(fmt.Sprintf("  [%s]  %s\r\n", e.ts.Format("15:04:05"), e.msg))
+			} else {
+				b.WriteString(fmt.Sprintf("  [%s]  %s  (x%d)\r\n", e.ts.Format("15:04:05"), e.msg, e.count))
+			}
+		}
+		b.WriteString("\r\nFull details: docker logs imap-bridge\r\n")
+	}
+
+	return bytes.NewReader([]byte(b.String()))
+}
+
+func nextReportTime() time.Time {
+	now := time.Now()
+	t := time.Date(now.Year(), now.Month(), now.Day(), 7, 0, 0, 0, now.Location())
+	if now.After(t) {
+		t = t.Add(24 * time.Hour)
+	}
+	return t
+}
+
+// runReporter fires at 07:00 local time each day, drains the error buffer,
+// and appends a digest email to report_label. Disabled if report_label is empty.
+func runReporter(ctx context.Context, dest *DestClient, destConf DestConfig) {
+	if destConf.ReportLabel == "" {
+		log.Println("report_label not configured — daily report disabled")
+		return
+	}
+
+	log.Printf("daily report enabled → %q at 07:00 local", destConf.ReportLabel)
+
+	for {
+		next := nextReportTime()
+		log.Printf("next report scheduled: %s", next.Format("2006-01-02 15:04:05"))
+
+		select {
+		case <-time.After(time.Until(next)):
+		case <-ctx.Done():
+			return
+		}
+
+		entries := errLog.drain()
+		msg := buildReportEmail(destConf.User, entries)
+
+		// Explicit empty flags — report always lands unread to catch your eye.
+		if err := dest.Append(ctx, destConf.ReportLabel, []string{}, msg); err != nil {
+			log.Printf("ERROR: failed to deliver daily report: %v", err)
+		} else {
+			log.Printf("daily report delivered to %q (%d distinct entries)", destConf.ReportLabel, len(entries))
+		}
 	}
 }
 
@@ -541,12 +704,22 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// Single shared DestClient — all goroutines use the same underlying connection.
+	dest := &DestClient{conf: conf.Destination}
+
 	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		runReporter(ctx, dest, conf.Destination)
+	}()
+
 	for _, src := range conf.Sources {
 		wg.Add(1)
 		go func(s SourceConfig) {
 			defer wg.Done()
-			monitorSource(ctx, s, conf.Destination, db)
+			monitorSource(ctx, s, dest, db)
 		}(src)
 	}
 
