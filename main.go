@@ -260,7 +260,7 @@ func connectAndLogin(
 			c.Logout()
 			return nil, nil, nil, err
 		}
-		if err := c.Authenticate(sasl.NewXoauth2Client(user, accessToken)); err != nil {
+		if err := c.Authenticate(sasl.NewXOAuth2Client(user, accessToken)); err != nil {
 			c.Logout()
 			return nil, nil, nil, fmt.Errorf("gmail xoauth2: %w", err)
 		}
@@ -475,8 +475,9 @@ func syncFolder(ctx context.Context, c *client.Client, dest *DestClient, db *sql
 			destFlags = append(destFlags, labels...)
 		}
 
-		// Fetch full message body using EntireSpecifier for broad server compatibility.
-		section := &imap.BodySectionName{Specifier: imap.EntireSpecifier}
+		// Fetch full message body. Zero-value BodySectionName (no section specifier)
+		// fetches the entire message — compatible with go-imap v1.2.x.
+		section := &imap.BodySectionName{}
 		bodyCh := make(chan *imap.Message, 1)
 		go c.UidFetch(set, []imap.FetchItem{section.FetchItem()}, bodyCh)
 		body := <-bodyCh
