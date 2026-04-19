@@ -12,7 +12,7 @@
 
   "sources": [
     {
-      "_note":          "Standard IMAP — retention_days:0 keeps forever",
+      "_note":          "Standard IMAP source — retention_days:0 keeps forever",
       "host":           "mail.example.com:993",
       "user":           "user@example.com",
       "pass":           "app-password-here",
@@ -20,9 +20,9 @@
       "skip_verify":    false,
       "retention_days": 0,
       "mappings": [
-        { "from": "INBOX",      "to": "INBOX" },
-        { "from": "INBOX/Sent", "to": "[Gmail]/Sent Mail" },
-        { "from": "INBOX/Work", "to": "Work", "labels": ["work-src"] }
+        { "from": "INBOX",      "to": ["INBOX"],                  "labels": ["example"] },
+        { "from": "INBOX/Sent", "to": ["[Gmail]/Sent Mail"]                              },
+        { "from": "INBOX/Work", "to": ["INBOX", "Bridged/Work"],  "labels": ["work"]    }
       ]
     },
     {
@@ -36,9 +36,9 @@
       "skip_verify":      false,
       "retention_days":   90,
       "mappings": [
-        { "from": "INBOX",             "to": "INBOX" },
-        { "from": "[Gmail]/Sent Mail", "to": "[Gmail]/Sent Mail" },
-        { "from": "[Gmail]/All Mail",  "to": "[Gmail]/All Mail" }
+        { "from": "INBOX",             "to": ["INBOX"]                },
+        { "from": "[Gmail]/Sent Mail", "to": ["[Gmail]/Sent Mail"]    },
+        { "from": "[Gmail]/All Mail",  "to": ["[Gmail]/All Mail"]     }
       ]
     }
   ]

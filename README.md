@@ -13,7 +13,8 @@ A resilient IMAP bridge that streams emails from multiple source accounts into a
 * **Read State Mirroring** — `\Seen` flag from source is mirrored to destination on sync
 * **Connection Efficient** — single shared destination connection, exponential backoff with jitter on source and destination
 * **Destination Retry** — failed appends retry up to 8 times with backoff; connection re-established automatically
-* **Gmail OAuth2** — XOAUTH2 for both source and destination; token refresh is automatic
+* **Gmail OAuth2** — OAUTHBEARER for both source and destination; token refresh is automatic
+* **Gmail Labels** — `X-GM-LABELS` applied after append via a dedicated long-lived label connection; queued, serialized, retried independently of message delivery
 * **Source Retention** — optional per-source pruning of messages older than N days (`retention_days: 0` keeps forever)
 * **Daily Digest** — error/warning report delivered as an email to a configurable label at 07:00; always arrives unread; repeated errors collapsed with a count
 * **Reliable Sync** — UID-based incremental sync, Message-ID deduplication
@@ -58,7 +59,7 @@ cp config.example.json config.json
       "security": "ssl",
       "retention_days": 0,
       "mappings": [
-        { "from": "INBOX", "to": "INBOX" }
+        { "from": "INBOX", "to": ["INBOX"] }
       ]
     }
   ]
@@ -112,30 +113,37 @@ docker logs -f imap-bridge
 | `token_file` | source / dest | Path to cached OAuth2 token (unique per account) |
 | `report_label` | dest only | Folder for daily error digest; empty = disabled |
 | `retention_days` | source only | Prune source messages older than N days; `0` = keep forever |
-| `mappings` | source only | `[{ "from": "...", "to": "...", "labels": ["tag"] }]` folder pairs; `labels` is optional — see *Mapping labels* below |
+| `mappings` | source only | `[{ "from": "...", "to": ["dest1", "dest2"], "labels": ["tag"] }]` — `to` is an array; `labels` is optional — see below |
 
 ---
 
-## 🏷️ Mapping labels
+## 📬 Multiple destinations & labels
 
-Each mapping can include an optional `labels` array. The strings are set as
-IMAP keywords (flags) on every message appended to the destination folder.
-On servers that support them as user-visible tags (e.g. Dovecot with
-`autocreate_keywords = yes`, or Gmail where keywords map to labels) this
-lets you tag bridged mail automatically.
+The `to` field is an array — list as many destination folders as you need. The message body is fetched from the source once. If there is only one destination it is streamed directly with no buffering. If there are multiple destinations the body is read into memory once and replayed, which is unavoidable since an `io.Reader` can only be consumed once.
+
+The optional `labels` array behaviour depends on the destination provider:
+
+- **Gmail** (`"provider": "gmail"`) — labels are applied via `X-GM-LABELS STORE` after each append, processed by a dedicated long-lived label connection. STOREs are queued and serialized; failures retry with the same backoff as the append connection and are logged to the daily digest. The message is always delivered even if the label store ultimately fails.
+- **Standard IMAP** (Dovecot, Courier etc.) — labels are set as IMAP keyword flags on the `APPEND` command itself. Server-dependent support.
 
 ```json
 "mappings": [
-  { "from": "INBOX",      "to": "INBOX",   "labels": ["bridged"] },
-  { "from": "INBOX/Work", "to": "Work",    "labels": ["bridged", "work-src"] }
+  {
+    "from": "INBOX",
+    "to":   ["INBOX", "Bridged/OVH"],
+    "labels": ["bridged"]
+  },
+  {
+    "from": "INBOX/Work",
+    "to":   ["INBOX", "Work"],
+    "labels": ["bridged", "work"]
+  }
 ]
 ```
 
-> **Note:** IMAP keywords are server-dependent. Gmail ignores arbitrary
-> keywords on APPEND; standard IMAP servers (Dovecot, Courier, etc.) support
-> them. Labels that the server does not accept are silently dropped by most
-> implementations — check your server's docs if tags are not appearing.
-> The built-in `\Seen` flag mirroring is unaffected by this field.
+> **Gmail note:** Gmail labels are also IMAP folders. To deliver to both inbox and a label folder, list both in `to`. The `labels` field applies Gmail labels (tags) on top of that. Gmail filters do not fire on IMAP-appended messages.
+
+Deduplication is tracked per `(message-id, destination-folder)` pair so the same message can be appended to multiple folders correctly. If one destination fails it is logged and retried on the next sync — other destinations for the same message are unaffected.
 
 ---
 
@@ -185,6 +193,8 @@ Once you've identified the folder names, add your `mappings` and restart.
 
 ---
 
+## 🔐 Security tips
+
 * Use **app passwords** for non-Gmail IMAP accounts
 * Use **OAuth2** for Gmail — Google blocks plain IMAP auth for most accounts
 * Set `chmod 600` on `client_secret.json` and all token files
@@ -199,9 +209,10 @@ Once you've identified the folder names, add your `mappings` and restart.
 2. Tracks the last seen UID per folder in SQLite
 3. On new mail (IMAP IDLE or 10-minute poll), fetches new messages
 4. Mirrors `\Seen` flag from source — read mail stays read on the destination
-5. Appends to the mapped destination folder; retries with backoff on failure
-6. Optionally prunes source messages older than `retention_days` after each sync
-7. Delivers a daily digest email at 07:00 with any errors or warnings (collapsed duplicates)
+5. Appends to every destination folder listed in `to`; retries with backoff on failure
+6. If destination is Gmail and `labels` are configured, enqueues a `X-GM-LABELS STORE` to a dedicated long-lived label connection that serializes and retries label application independently of delivery
+7. Optionally prunes source messages older than `retention_days` after each sync
+8. Delivers a daily digest email at 07:00 with any errors or warnings (collapsed duplicates)
 
 ---
 

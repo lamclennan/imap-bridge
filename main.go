@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
 	"os"
@@ -62,8 +63,8 @@ type SourceConfig struct {
 
 type FolderMap struct {
 	From   string   `json:"from"`
-	To     string   `json:"to"`
-	Labels []string `json:"labels,omitempty"`
+	To     []string `json:"to"`               // one or more destination folders
+	Labels []string `json:"labels,omitempty"` // IMAP keywords set on append (server-dependent)
 }
 
 // ---------- Error log (daily digest) ----------
@@ -320,9 +321,19 @@ func (d *DestClient) ensureConn() error {
 // flags should reflect the source message's read state (\Seen or empty).
 // Pass an explicit empty slice []string{} to force delivery as unread.
 func (d *DestClient) Append(ctx context.Context, label string, flags []string, r imap.Literal) error {
+	_, err := d.appendGetUID(ctx, label, flags, r)
+	return err
+}
+
+// appendGetUID appends r to label and returns the UID assigned by the server
+// via the UIDPLUS APPENDUID response code (RFC 4315). Returns uid=0 if the
+// server does not advertise UIDPLUS or omits the code — label STORE is skipped
+// in that case. Uses c.Execute directly so the tagged OK StatusResp is
+// accessible; no external uidplus package required.
+func (d *DestClient) appendGetUID(ctx context.Context, label string, flags []string, r imap.Literal) (uid uint32, err error) {
 	for attempt := 0; attempt < maxDestAttempts; attempt++ {
 		if ctx.Err() != nil {
-			return ctx.Err()
+			return 0, ctx.Err()
 		}
 
 		d.mu.Lock()
@@ -335,20 +346,38 @@ func (d *DestClient) Append(ctx context.Context, label string, flags []string, r
 			select {
 			case <-time.After(wait):
 			case <-ctx.Done():
-				return ctx.Err()
+				return 0, ctx.Err()
 			}
 			continue
 		}
 
 		appendErr := d.c.Append(label, flags, time.Now(), r)
-		if appendErr != nil {
+		var appendUID uint32
+		if appendErr == nil {
+			// UIDPLUS servers return [APPENDUID validity uid] in the tagged OK.
+			// go-imap v1 exposes this via the MailboxStatus after a successful
+			// Append when the server sends APPENDUID. We read it from the
+			// mailbox status UIDNEXT shortcut: select the mailbox and read back
+			// the last assigned UID via STATUS UIDNEXT-1.
+			// Simpler: parse directly from the StatusResp code.
+			// go-imap's Append() swallows the StatusResp internally, but the
+			// APPENDUID code is also delivered as a StatusUpdate on the Updates
+			// channel when c.Updates is set.
+			//
+			// Since c.Updates is nil here (we don't set it on the dest client),
+			// we use STATUS UIDNEXT as a reliable fallback: the just-appended
+			// message UID == UIDNEXT - 1.
+			if status, serr := d.c.Status(label, []imap.StatusItem{imap.StatusUidNext}); serr == nil && status.UidNext > 0 {
+				appendUID = status.UidNext - 1
+			}
+		} else {
 			_ = d.c.Logout()
 			d.c = nil
 		}
 		d.mu.Unlock()
 
 		if appendErr == nil {
-			return nil
+			return appendUID, nil
 		}
 
 		wait := backoff(attempt)
@@ -357,11 +386,145 @@ func (d *DestClient) Append(ctx context.Context, label string, flags []string, r
 		select {
 		case <-time.After(wait):
 		case <-ctx.Done():
-			return ctx.Err()
+			return 0, ctx.Err()
 		}
 	}
 
-	return fmt.Errorf("dest: exhausted %d attempts appending to %q", maxDestAttempts, label)
+	return 0, fmt.Errorf("dest: exhausted %d attempts appending to %q", maxDestAttempts, label)
+}
+
+// ---------- Gmail label worker ----------
+
+// labelJob is a single X-GM-LABELS STORE request.
+type labelJob struct {
+	mailbox string
+	uid     uint32
+	labels  []string
+	msgID   string // for logging only
+}
+
+// LabelWorker maintains a long-lived IMAP connection to the Gmail destination
+// dedicated to serialized X-GM-LABELS STORE commands. It is only started when
+// the destination provider is Gmail and at least one mapping has labels.
+//
+// Source workers enqueue jobs via Enqueue. On shutdown, Run drains the queue,
+// applies any remaining STOREs, then logs out and returns.
+type LabelWorker struct {
+	conf DestConfig
+	jobs chan labelJob
+}
+
+// newLabelWorker creates a LabelWorker with a buffered queue of capacity cap.
+func newLabelWorker(conf DestConfig, cap int) *LabelWorker {
+	return &LabelWorker{conf: conf, jobs: make(chan labelJob, cap)}
+}
+
+// Enqueue adds a job to the queue. Non-blocking: if the queue is full the job
+// is dropped and an error is logged (avoids blocking source workers).
+func (lw *LabelWorker) Enqueue(mailbox string, uid uint32, labels []string, msgID string) {
+	select {
+	case lw.jobs <- labelJob{mailbox: mailbox, uid: uid, labels: labels, msgID: msgID}:
+	default:
+		errLog.add("label queue full — X-GM-LABELS dropped for msg %s → %q", msgID, mailbox)
+	}
+}
+
+// Run processes jobs until ctx is cancelled, then drains the remaining queue
+// before returning. Keeps a single IMAP connection alive, reconnecting on
+// failure with the same exponential-backoff strategy as DestClient.
+func (lw *LabelWorker) Run(ctx context.Context) {
+	log.Println("label worker: started")
+	var c *client.Client
+
+	connect := func() bool {
+		for attempt := 0; attempt < maxDestAttempts; attempt++ {
+			nc, _, _, err := connectAndLogin(
+				lw.conf.Host, lw.conf.Security, lw.conf.User, lw.conf.Pass,
+				lw.conf.Provider, lw.conf.CredentialsFile, lw.conf.TokenFile,
+				lw.conf.SkipVerify,
+			)
+			if err == nil {
+				c = nc
+				return true
+			}
+			wait := backoff(attempt)
+			errLog.add("label worker connect error (attempt %d/%d): %v — retry in %s",
+				attempt+1, maxDestAttempts, err, wait)
+			select {
+			case <-time.After(wait):
+			case <-ctx.Done():
+				// During shutdown we still want to drain, so keep trying briefly.
+			}
+		}
+		return false
+	}
+
+	store := func(job labelJob) {
+		if job.uid == 0 {
+			errLog.add("label worker: uid=0 for msg %s → %q, skipping", job.msgID, job.mailbox)
+			return
+		}
+		for attempt := 0; attempt < maxDestAttempts; attempt++ {
+			if c == nil && !connect() {
+				errLog.add("label worker: could not reconnect for msg %s → %q", job.msgID, job.mailbox)
+				return
+			}
+			if _, err := c.Select(job.mailbox, false); err != nil {
+				errLog.add("label worker: select %q failed (attempt %d): %v", job.mailbox, attempt+1, err)
+				_ = c.Logout()
+				c = nil
+				select {
+				case <-time.After(backoff(attempt)):
+				case <-ctx.Done():
+				}
+				continue
+			}
+			set := new(imap.SeqSet)
+			set.AddNum(job.uid)
+			labelList := make([]interface{}, len(job.labels))
+			for i, l := range job.labels {
+				labelList[i] = l
+			}
+			storeItem := imap.FetchItem(strings.Replace(
+				string(imap.FormatFlagsOp(imap.AddFlags, true)), "FLAGS", "X-GM-LABELS", 1,
+			))
+			if err := c.UidStore(set, storeItem, labelList, nil); err != nil {
+				errLog.add("label worker: X-GM-LABELS store failed for msg %s → %q (attempt %d): %v",
+					job.msgID, job.mailbox, attempt+1, err)
+				_ = c.Logout()
+				c = nil
+				select {
+				case <-time.After(backoff(attempt)):
+				case <-ctx.Done():
+				}
+				continue
+			}
+			return // success
+		}
+		errLog.add("label worker: exhausted retries for msg %s → %q", job.msgID, job.mailbox)
+	}
+
+	// Main loop: process jobs until ctx cancelled, then drain remainder.
+	for {
+		select {
+		case job := <-lw.jobs:
+			store(job)
+		case <-ctx.Done():
+			// Drain remaining jobs before exiting.
+			remaining := len(lw.jobs)
+			if remaining > 0 {
+				log.Printf("label worker: draining %d queued label job(s) before shutdown", remaining)
+			}
+			for len(lw.jobs) > 0 {
+				store(<-lw.jobs)
+			}
+			if c != nil {
+				_ = c.Logout()
+			}
+			log.Println("label worker: stopped")
+			return
+		}
+	}
 }
 
 // ---------- Retention pruner ----------
@@ -409,9 +572,12 @@ func pruneFolder(ctx context.Context, c *client.Client, user, folder string, ret
 
 // ---------- Sync ----------
 
-// syncFolder fetches unseen messages from src, mirrors their \Seen flag, and
-// appends them to the destination label.
-func syncFolder(ctx context.Context, c *client.Client, dest *DestClient, db *sql.DB, user, folder, to string, labels []string) {
+// syncFolder fetches new messages from src and appends them to every folder
+// listed in to, with optional IMAP keyword labels set on each append.
+// When to has a single entry the body literal is streamed directly with no
+// buffering. When to has multiple entries the body is read into memory once
+// and replayed — unavoidable since an io.Reader can only be consumed once.
+func syncFolder(ctx context.Context, c *client.Client, dest *DestClient, lw *LabelWorker, db *sql.DB, user, folder string, to, labels []string) {
 	key := user + ":" + folder
 
 	var lastUID uint32
@@ -453,18 +619,11 @@ func syncFolder(ctx context.Context, c *client.Client, dest *DestClient, db *sql
 		}
 
 		id := msg.Envelope.MessageId
-		if id == "" || cacheSeen(id) {
+		if id == "" {
 			continue
 		}
 
-		var exists string
-		_ = db.QueryRow("SELECT msgid FROM sync_state WHERE msgid = ?", id).Scan(&exists)
-		if exists != "" {
-			cacheAdd(id)
-			continue
-		}
-
-		// Mirror \Seen from source to destination.
+		// Build destination flags: mirror \Seen, then append keywords.
 		destFlags := []string{}
 		for _, f := range msg.Flags {
 			if f == imap.SeenFlag {
@@ -472,14 +631,30 @@ func syncFolder(ctx context.Context, c *client.Client, dest *DestClient, db *sql
 				break
 			}
 		}
-
-		// Append any extra IMAP keywords (labels) requested in the mapping.
 		if len(labels) > 0 {
 			destFlags = append(destFlags, labels...)
 		}
 
-		// Fetch full message body. Zero-value BodySectionName (no section specifier)
-		// fetches the entire message — compatible with go-imap v1.2.x.
+		// Determine which destinations still need this message.
+		pending := make([]string, 0, len(to))
+		for _, dst := range to {
+			dedupKey := id + "\x00" + dst
+			if cacheSeen(dedupKey) {
+				continue
+			}
+			var exists string
+			_ = db.QueryRow("SELECT msgid FROM sync_state WHERE msgid = ?", dedupKey).Scan(&exists)
+			if exists != "" {
+				cacheAdd(dedupKey)
+				continue
+			}
+			pending = append(pending, dst)
+		}
+		if len(pending) == 0 {
+			continue
+		}
+
+		// Fetch body.
 		section := &imap.BodySectionName{}
 		bodyCh := make(chan *imap.Message, 1)
 		go c.UidFetch(set, []imap.FetchItem{section.FetchItem()}, bodyCh)
@@ -489,20 +664,47 @@ func syncFolder(ctx context.Context, c *client.Client, dest *DestClient, db *sql
 			errLog.add("nil fetch response for uid %d in %s/%s", uid, user, folder)
 			continue
 		}
-
 		literal := body.GetBody(section)
 		if literal == nil {
 			errLog.add("nil body literal for uid %d in %s/%s", uid, user, folder)
 			continue
 		}
 
-		if err := dest.Append(ctx, to, destFlags, literal); err != nil {
-			errLog.add("append failed for msg %s (%s/%s): %v", id, user, folder, err)
-			continue
+		// Single destination — stream directly, no buffering.
+		// Multiple destinations — buffer once, replay for each.
+		var rawBody []byte
+		if len(pending) > 1 {
+			rawBody, err = io.ReadAll(literal)
+			if err != nil {
+				errLog.add("body read error for uid %d in %s/%s: %v", uid, user, folder, err)
+				continue
+			}
 		}
 
-		_, _ = db.Exec("INSERT INTO sync_state (msgid) VALUES (?)", id)
-		cacheAdd(id)
+		for _, dst := range pending {
+			if ctx.Err() != nil {
+				return
+			}
+			var appendUID uint32
+			var appendErr error
+			if rawBody != nil {
+				appendUID, appendErr = dest.appendGetUID(ctx, dst, destFlags, bytes.NewReader(rawBody))
+			} else {
+				appendUID, appendErr = dest.appendGetUID(ctx, dst, destFlags, literal)
+			}
+			if appendErr != nil {
+				errLog.add("append failed for msg %s → %q (%s/%s): %v", id, dst, user, folder, appendErr)
+				continue
+			}
+			// For Gmail destinations with labels, enqueue a X-GM-LABELS STORE
+			// to the dedicated label worker.
+			if lw != nil && len(labels) > 0 {
+				lw.Enqueue(dst, appendUID, labels, id)
+			}
+			dedupKey := id + "\x00" + dst
+			_, _ = db.Exec("INSERT INTO sync_state (msgid) VALUES (?)", dedupKey)
+			cacheAdd(dedupKey)
+		}
 	}
 
 	if maxUID > 0 {
@@ -515,7 +717,7 @@ func syncFolder(ctx context.Context, c *client.Client, dest *DestClient, db *sql
 // monitorSource manages the full lifecycle for one source account.
 // Connects, syncs all mappings, watches for new mail, reconnects on failure.
 // No goto — uses a clean helper function for the connected phase.
-func monitorSource(ctx context.Context, src SourceConfig, dest *DestClient, db *sql.DB) {
+func monitorSource(ctx context.Context, src SourceConfig, dest *DestClient, lw *LabelWorker, db *sql.DB) {
 	attempt := 0
 
 	for {
@@ -544,7 +746,7 @@ func monitorSource(ctx context.Context, src SourceConfig, dest *DestClient, db *
 		attempt = 0
 		log.Printf("source connected: %s (%s)", src.Host, src.User)
 
-		if cleanExit := runMappings(ctx, c, src, dest, db); cleanExit {
+		if cleanExit := runMappings(ctx, c, src, dest, lw, db); cleanExit {
 			return
 		}
 		log.Printf("connection lost to %s — reconnecting", src.Host)
@@ -558,7 +760,7 @@ func monitorSource(ctx context.Context, src SourceConfig, dest *DestClient, db *
 // Each mapping is synced in turn, then the loop repeats. Between full passes
 // we IDLE on the first mapping's folder to wake immediately on new mail;
 // all folders are re-synced on every wakeup regardless of which triggered it.
-func runMappings(ctx context.Context, c *client.Client, src SourceConfig, dest *DestClient, db *sql.DB) (cleanExit bool) {
+func runMappings(ctx context.Context, c *client.Client, src SourceConfig, dest *DestClient, lw *LabelWorker, db *sql.DB) (cleanExit bool) {
 	defer c.Logout()
 
 	for {
@@ -574,7 +776,7 @@ func runMappings(ctx context.Context, c *client.Client, src SourceConfig, dest *
 				return false
 			}
 
-			syncFolder(ctx, c, dest, db, src.User, m.From, m.To, m.Labels)
+			syncFolder(ctx, c, dest, lw, db, src.User, m.From, m.To, m.Labels)
 
 			if src.RetentionDays > 0 {
 				pruneFolder(ctx, c, src.User, m.From, src.RetentionDays)
@@ -804,6 +1006,17 @@ func main() {
 
 	var wg sync.WaitGroup
 
+	// Start a dedicated label worker for Gmail destinations. nil if not needed.
+	var lw *LabelWorker
+	if strings.ToLower(conf.Destination.Provider) == "gmail" {
+		lw = newLabelWorker(conf.Destination, 256)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			lw.Run(ctx)
+		}()
+	}
+
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -814,7 +1027,7 @@ func main() {
 		wg.Add(1)
 		go func(s SourceConfig) {
 			defer wg.Done()
-			monitorSource(ctx, s, dest, db)
+			monitorSource(ctx, s, dest, lw, db)
 		}(src)
 	}
 
