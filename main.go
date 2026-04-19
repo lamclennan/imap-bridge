@@ -63,8 +63,37 @@ type SourceConfig struct {
 
 type FolderMap struct {
 	From   string   `json:"from"`
-	To     []string `json:"to"`               // one or more destination folders
+	To     []string `json:"to"`               // one or more destination folders; string or array
 	Labels []string `json:"labels,omitempty"` // IMAP keywords set on append (server-dependent)
+}
+
+// UnmarshalJSON lets "to" be either a plain string or an array of strings
+// so existing configs with "to": "INBOX" continue to work alongside
+// the newer "to": ["INBOX", "Label"] form.
+func (f *FolderMap) UnmarshalJSON(b []byte) error {
+	// Use an alias to avoid infinite recursion.
+	type Alias struct {
+		From   string          `json:"from"`
+		To     json.RawMessage `json:"to"`
+		Labels []string        `json:"labels,omitempty"`
+	}
+	var a Alias
+	if err := json.Unmarshal(b, &a); err != nil {
+		return err
+	}
+	f.From = a.From
+	f.Labels = a.Labels
+	if len(a.To) > 0 {
+		// Try array first, fall back to plain string.
+		if err := json.Unmarshal(a.To, &f.To); err != nil {
+			var s string
+			if err2 := json.Unmarshal(a.To, &s); err2 != nil {
+				return err2
+			}
+			f.To = []string{s}
+		}
+	}
+	return nil
 }
 
 // ---------- Error log (daily digest) ----------
@@ -485,7 +514,7 @@ func (lw *LabelWorker) Run(ctx context.Context) {
 			for i, l := range job.labels {
 				labelList[i] = l
 			}
-			storeItem := imap.FetchItem(strings.Replace(
+			storeItem := imap.StoreItem(strings.Replace(
 				string(imap.FormatFlagsOp(imap.AddFlags, true)), "FLAGS", "X-GM-LABELS", 1,
 			))
 			if err := c.UidStore(set, storeItem, labelList, nil); err != nil {
@@ -1036,3 +1065,4 @@ func main() {
 	wg.Wait()
 	log.Println("clean exit")
 }
+
