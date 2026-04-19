@@ -554,23 +554,24 @@ func monitorSource(ctx context.Context, src SourceConfig, dest *DestClient, db *
 // runMappings runs the sync+polling loop for all folder mappings on an open connection.
 // Returns true if the exit was due to ctx cancellation (clean shutdown),
 // false if the connection broke and a reconnect is needed.
+//
+// Each mapping is synced in turn, then the loop repeats. Between full passes
+// we IDLE on the first mapping's folder to wake immediately on new mail;
+// all folders are re-synced on every wakeup regardless of which triggered it.
 func runMappings(ctx context.Context, c *client.Client, src SourceConfig, dest *DestClient, db *sql.DB) (cleanExit bool) {
 	defer c.Logout()
 
-	for _, m := range src.Mappings {
-		if ctx.Err() != nil {
-			return true
-		}
-
-		// Select read-write (false) so pruneFolder can expunge if needed.
-		if _, err := c.Select(m.From, false); err != nil {
-			errLog.add("select %q failed on %s: %v — reconnecting", m.From, src.Host, err)
-			return false
-		}
-
-		for {
+	for {
+		// Sync every mapping in sequence.
+		for _, m := range src.Mappings {
 			if ctx.Err() != nil {
 				return true
+			}
+
+			// Select read-write so pruneFolder can expunge if needed.
+			if _, err := c.Select(m.From, false); err != nil {
+				errLog.add("select %q failed on %s: %v — reconnecting", m.From, src.Host, err)
+				return false
 			}
 
 			syncFolder(ctx, c, dest, db, src.User, m.From, m.To, m.Labels)
@@ -578,30 +579,69 @@ func runMappings(ctx context.Context, c *client.Client, src SourceConfig, dest *
 			if src.RetentionDays > 0 {
 				pruneFolder(ctx, c, src.User, m.From, src.RetentionDays)
 			}
+		}
 
-			updates := make(chan client.Update, 10)
-			c.Updates = updates
+		if ctx.Err() != nil {
+			return true
+		}
 
-			select {
-			case <-updates:
-				// New mail notification — re-sync immediately.
+		// After syncing all folders, IDLE on the first mapping's folder to
+		// receive push notifications for new mail. Fall back to a 10-minute
+		// poll if the server doesn't support IDLE.
+		if len(src.Mappings) > 0 {
+			if _, err := c.Select(src.Mappings[0].From, false); err != nil {
+				errLog.add("select %q for idle failed on %s: %v — reconnecting", src.Mappings[0].From, src.Host, err)
+				return false
+			}
+		}
 
-			case <-time.After(10 * time.Minute):
-				if err := c.Noop(); err != nil {
-					errLog.add("noop failed on %s: %v — reconnecting", src.Host, err)
-					return false
-				}
+		updates := make(chan client.Update, 16)
+		c.Updates = updates
 
-			case <-ctx.Done():
-				return true
+		idleDone := make(chan struct{})
+		idleErr := make(chan error, 1)
+		go func() {
+			idleErr <- c.Idle(idleDone, nil)
+		}()
+
+		select {
+		case <-updates:
+			// Server pushed an EXISTS or RECENT — new mail arrived.
+			// Signal IDLE to stop, wait for the goroutine to finish.
+			close(idleDone)
+			if err := <-idleErr; err != nil {
+				errLog.add("idle error on %s: %v — reconnecting", src.Host, err)
+				c.Updates = nil
+				return false
 			}
 
-			// Clear updates channel for next iteration
-			c.Updates = nil
-		}
-	}
+		case err := <-idleErr:
+			// IDLE returned on its own (server closed it, or not supported).
+			if err != nil {
+				errLog.add("idle ended on %s: %v — reconnecting", src.Host, err)
+				c.Updates = nil
+				return false
+			}
 
-	return true
+		case <-time.After(10 * time.Minute):
+			// Keepalive: exit IDLE, send NOOP, then re-sync.
+			close(idleDone)
+			<-idleErr
+			if err := c.Noop(); err != nil {
+				errLog.add("noop failed on %s: %v — reconnecting", src.Host, err)
+				c.Updates = nil
+				return false
+			}
+
+		case <-ctx.Done():
+			close(idleDone)
+			<-idleErr
+			c.Updates = nil
+			return true
+		}
+
+		c.Updates = nil
+	}
 }
 
 // ---------- Report ----------
