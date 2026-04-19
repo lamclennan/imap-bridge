@@ -624,6 +624,7 @@ func syncFolder(ctx context.Context, c *client.Client, dest *DestClient, lw *Lab
 		errLog.add("UID search error on %s/%s: %v", user, folder, err)
 		return
 	}
+	log.Printf("DEBUG syncFolder %s/%s: lastUID=%d found=%d uids", user, folder, lastUID, len(uids))
 
 	var maxUID uint32
 
@@ -649,7 +650,9 @@ func syncFolder(ctx context.Context, c *client.Client, dest *DestClient, lw *Lab
 
 		id := msg.Envelope.MessageId
 		if id == "" {
-			continue
+			// No Message-ID — synthesise a stable dedup key from account+folder+uid.
+			// This is not globally unique but is stable across restarts for this source.
+			id = fmt.Sprintf("__noid__%s_%s_%d", user, folder, uid)
 		}
 
 		// Build destination flags: mirror \Seen, then append keywords.
@@ -669,11 +672,13 @@ func syncFolder(ctx context.Context, c *client.Client, dest *DestClient, lw *Lab
 		for _, dst := range to {
 			dedupKey := id + "\x00" + dst
 			if cacheSeen(dedupKey) {
+				log.Printf("DEBUG uid=%d id=%q dst=%q — skipped (cache)", uid, id, dst)
 				continue
 			}
 			var exists string
 			_ = db.QueryRow("SELECT msgid FROM sync_state WHERE msgid = ?", dedupKey).Scan(&exists)
 			if exists != "" {
+				log.Printf("DEBUG uid=%d id=%q dst=%q — skipped (db)", uid, id, dst)
 				cacheAdd(dedupKey)
 				continue
 			}
@@ -725,6 +730,7 @@ func syncFolder(ctx context.Context, c *client.Client, dest *DestClient, lw *Lab
 				errLog.add("append failed for msg %s → %q (%s/%s): %v", id, dst, user, folder, appendErr)
 				continue
 			}
+			log.Printf("DEBUG uid=%d id=%q → %q appended OK (destUID=%d)", uid, id, dst, appendUID)
 			// For Gmail destinations with labels, enqueue a X-GM-LABELS STORE
 			// to the dedicated label worker.
 			if lw != nil && len(labels) > 0 {
@@ -1065,4 +1071,3 @@ func main() {
 	wg.Wait()
 	log.Println("clean exit")
 }
-
