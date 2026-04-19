@@ -260,9 +260,12 @@ func connectAndLogin(
 			c.Logout()
 			return nil, nil, nil, err
 		}
-		if err := c.Authenticate(sasl.NewXOAuth2Client(user, accessToken)); err != nil {
+		if err := c.Authenticate(sasl.NewOAuthBearerClient(&sasl.OAuthBearerOptions{
+			Username: user,
+			Token:    accessToken,
+		})); err != nil {
 			c.Logout()
-			return nil, nil, nil, fmt.Errorf("gmail xoauth2: %w", err)
+			return nil, nil, nil, fmt.Errorf("gmail oauthbearer: %w", err)
 		}
 		return c, cfg, tok, nil
 	}
