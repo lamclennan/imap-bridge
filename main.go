@@ -9,7 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math/rand"
+	mrand "math/rand"
 	"os"
 	"os/signal"
 	"regexp"
@@ -20,6 +20,7 @@ import (
 
 	"github.com/emersion/go-imap"
 	"github.com/emersion/go-imap/client"
+	"github.com/emersion/go-imap/commands"
 	"github.com/emersion/go-sasl"
 	_ "github.com/mattn/go-sqlite3"
 	"golang.org/x/oauth2"
@@ -217,8 +218,14 @@ func initDB(path string) *sql.DB {
 // ---------- Backoff ----------
 
 func backoff(attempt int) time.Duration {
+	if attempt < 0 {
+		attempt = 0
+	}
+	if attempt > 10 {
+		attempt = 10
+	}
 	base := time.Second * time.Duration(1<<attempt)
-	jitter := time.Duration(rand.Intn(1000)) * time.Millisecond
+	jitter := time.Duration(mrand.Intn(1000)) * time.Millisecond
 	if base > time.Minute {
 		base = time.Minute
 	}
@@ -349,10 +356,11 @@ const maxMsgAttempts = 5
 type DestClient struct {
 	conf DestConfig
 
-	mu       sync.Mutex
-	c        *client.Client
-	oauthCfg *oauth2.Config
-	oauthTok *oauth2.Token
+	mu         sync.Mutex
+	c          *client.Client
+	oauthCfg   *oauth2.Config
+	oauthTok   *oauth2.Token
+	hasUIDPLUS bool // cached per connection; set during redial
 }
 
 func (d *DestClient) redial() error {
@@ -370,6 +378,15 @@ func (d *DestClient) redial() error {
 		return err
 	}
 	d.c, d.oauthCfg, d.oauthTok = c, oCfg, oTok
+	// Detect UIDPLUS once per connection. Failure to query is treated as absent.
+	if ok, err := c.Support("UIDPLUS"); err == nil {
+		d.hasUIDPLUS = ok
+	} else {
+		d.hasUIDPLUS = false
+	}
+	if !d.hasUIDPLUS && strings.ToLower(cfg.Provider) == "gmail" {
+		log.Printf("WARNING: destination %s does not advertise UIDPLUS — X-GM-LABELS will not be applied", cfg.Host)
+	}
 	return nil
 }
 
@@ -380,25 +397,30 @@ func (d *DestClient) ensureConn() error {
 	return d.redial()
 }
 
-// errDestDown is returned by appendGetUID when the destination cannot be
-// reached after all retries. Distinct from a message-level rejection so
-// syncFolder can abort the entire pass rather than burning failure counts.
+// errDestDown is returned by appendGetUID when the destination connection
+// cannot execute IMAP commands reliably (EOF, broken pipe, auth failure,
+// or repeated failed reconnects). Distinct from a server-level message
+// rejection so syncFolder can abort the pass without burning failure counts.
 var errDestDown = fmt.Errorf("destination unreachable")
 
 // Append delivers r to label with flags, retrying with exponential backoff.
-// flags should reflect the source message's read state (\Seen or empty).
-// Pass an explicit empty slice []string{} to force delivery as unread.
 func (d *DestClient) Append(ctx context.Context, label string, flags []string, r imap.Literal) error {
 	_, err := d.appendGetUID(ctx, label, flags, r)
 	return err
 }
 
-// appendGetUID appends r to label and returns the UID assigned by the server
-// via the UIDPLUS APPENDUID response code (RFC 4315). Returns uid=0 if the
-// server does not advertise UIDPLUS or omits the code — label STORE is skipped
-// in that case. Returns errDestDown if the destination cannot be reached after
-// all retries, so the caller can abort the sync pass without burning per-message
-// failure counts.
+// appendGetUID appends r to label and returns the server-assigned UID.
+//
+// UID resolution is UIDPLUS-only (RFC 4315). If the destination supports
+// UIDPLUS, the APPENDUID response code in the tagged OK is the sole UID
+// source — exact and race-free. If UIDPLUS is absent, uid=0 is returned
+// and the append is still considered successful; label STORE is skipped.
+//
+// The literal r is streamed directly — no buffering occurs here.
+// Each call must receive its own independent reader; readers are never reused.
+//
+// Returns errDestDown only on connection-level failures (EOF, broken pipe,
+// auth failure, repeated reconnect failures) — not on server NO/BAD responses.
 func (d *DestClient) appendGetUID(ctx context.Context, label string, flags []string, r imap.Literal) (uid uint32, err error) {
 	connFails := 0
 	for attempt := 0; attempt < maxDestAttempts; attempt++ {
@@ -422,36 +444,49 @@ func (d *DestClient) appendGetUID(ctx context.Context, label string, flags []str
 			continue
 		}
 
-		appendErr := d.c.Append(label, flags, time.Now(), r)
-		var appendUID uint32
-		if appendErr == nil {
-			if status, serr := d.c.Status(label, []imap.StatusItem{imap.StatusUidNext}); serr == nil && status.UidNext > 0 {
-				appendUID = status.UidNext - 1
+		cmd := &commands.Append{
+			Mailbox: label,
+			Flags:   flags,
+			Date:    time.Now(),
+			Message: r,
+		}
+		status, execErr := d.c.Execute(cmd, nil)
+
+		if execErr != nil {
+			// Server NO/BAD response — connection is still alive, don't count
+			// as connection failure. Any other error is a connection-level fault.
+			if _, isServerResp := execErr.(*imap.StatusResp); !isServerResp {
+				_ = d.c.Logout()
+				d.c = nil
+				d.hasUIDPLUS = false
+				connFails++
 			}
-		} else {
-			_ = d.c.Logout()
-			d.c = nil
+			d.mu.Unlock()
+			wait := backoff(attempt)
+			errLog.add("dest append error (attempt %d/%d): %v — retry in %s",
+				attempt+1, maxDestAttempts, execErr, wait)
+			select {
+			case <-time.After(wait):
+			case <-ctx.Done():
+				return 0, ctx.Err()
+			}
+			continue
 		}
+
+		// Append succeeded. Extract APPENDUID if UIDPLUS is supported.
+		appendUID := uint32(0)
+		if d.hasUIDPLUS && status != nil &&
+			strings.EqualFold(string(status.Code), "APPENDUID") &&
+			len(status.Arguments) >= 2 {
+			if v, ok := status.Arguments[1].(uint32); ok {
+				appendUID = v
+			}
+		}
+
 		d.mu.Unlock()
-
-		if appendErr == nil {
-			return appendUID, nil
-		}
-
-		wait := backoff(attempt)
-		errLog.add("dest append error (attempt %d/%d): %v — retry in %s",
-			attempt+1, maxDestAttempts, appendErr, wait)
-		select {
-		case <-time.After(wait):
-		case <-ctx.Done():
-			return 0, ctx.Err()
-		}
+		return appendUID, nil
 	}
 
-	// If every attempt was a connection failure (never got a response from the
-	// server), return errDestDown so the caller aborts the sync pass cleanly.
-	// If at least one attempt connected but the server rejected the message,
-	// return a regular error so the failure counter is incremented.
 	if connFails == maxDestAttempts {
 		return 0, errDestDown
 	}
@@ -702,9 +737,10 @@ func syncFolder(ctx context.Context, c *client.Client, dest *DestClient, lw *Lab
 		}
 
 		// Build destination flags: mirror \Seen, then append keywords.
+		// Use case-insensitive comparison — some servers return \seen lowercase.
 		destFlags := []string{}
 		for _, f := range msg.Flags {
-			if f == imap.SeenFlag {
+			if strings.EqualFold(f, imap.SeenFlag) {
 				destFlags = append(destFlags, imap.SeenFlag)
 				break
 			}
@@ -784,13 +820,16 @@ func syncFolder(ctx context.Context, c *client.Client, dest *DestClient, lw *Lab
 			continue
 		}
 
-		// Single destination — stream directly, no buffering.
-		// Multiple destinations — buffer once, replay for each.
+		// Body handling: stream directly to a single destination; buffer once
+		// only when multiple destinations require independent readers.
+		// io.Reader can only be consumed once — buffering is unavoidable for
+		// multi-destination but must not occur for the single-destination path.
 		var rawBody []byte
 		if len(pending) > 1 {
-			rawBody, err = io.ReadAll(literal)
-			if err != nil {
-				errLog.add("body read error for uid %d in %s/%s: %v", uid, user, folder, err)
+			var readErr error
+			rawBody, readErr = io.ReadAll(literal)
+			if readErr != nil {
+				errLog.add("body read error for uid %d in %s/%s: %v", uid, user, folder, readErr)
 				continue
 			}
 		}
@@ -801,13 +840,13 @@ func syncFolder(ctx context.Context, c *client.Client, dest *DestClient, lw *Lab
 			if ctx.Err() != nil {
 				return
 			}
-			var appendUID uint32
-			var appendErr error
+			var r imap.Literal
 			if rawBody != nil {
-				appendUID, appendErr = dest.appendGetUID(ctx, dst, destFlags, bytes.NewReader(rawBody))
+				r = bytes.NewReader(rawBody)
 			} else {
-				appendUID, appendErr = dest.appendGetUID(ctx, dst, destFlags, literal)
+				r = literal
 			}
+			appendUID, appendErr := dest.appendGetUID(ctx, dst, destFlags, r)
 			if appendErr != nil {
 				if appendErr == errDestDown {
 					// Destination is unreachable — abort this entire sync pass.
@@ -824,7 +863,10 @@ func syncFolder(ctx context.Context, c *client.Client, dest *DestClient, lw *Lab
 				continue
 			}
 			debugLog("uid=%d id=%q → %q appended OK (destUID=%d)", uid, id, dst, appendUID)
-			if lw != nil && len(labels) > 0 {
+			// Labels via X-GM-LABELS require a UIDPLUS-derived UID.
+			// If uid=0 (UIDPLUS absent), skip label STORE silently —
+			// a startup warning is emitted if this condition is expected.
+			if lw != nil && len(labels) > 0 && appendUID > 0 {
 				lw.Enqueue(dst, appendUID, labels, id)
 			}
 			dedupKey := id + "\x00" + dst
