@@ -11,10 +11,14 @@ services:
       # Runtime config — edit on the host, restart container to apply
       - ./config.json:/app/config.json:ro
 
-      # OAuth2 client credentials (read-only)
-      - ./client_secret.json:/app/client_secret.json:ro
+      # OAuth2 client credential files — one per Gmail Cloud project, read-only.
+      # Place all client_secret_*.json files here and reference them in config.json
+      # as e.g. "credentials_file": "keys/client_secret_account1.json"
+      - ./keys:/app/keys:ro
 
-      # Token cache — writable so the bridge can persist refreshed tokens
+      # Token cache — writable so the bridge can persist refreshed tokens.
+      # One token file per Gmail account, referenced in config.json as
+      # e.g. "token_file": "tokens/token_account1.json"
       - ./tokens:/app/tokens
 
     # Run the OAuth2 first-time authorisation flow interactively:

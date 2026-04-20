@@ -24,8 +24,9 @@ COPY --from=builder /app/bridge .
 
 # data/          — SQLite state db (persistent volume)
 # config.json    — mounted at runtime via docker-compose volume
-# *.json creds   — client_secret.json and token_*.json mounted at runtime
-RUN mkdir -p /app/data && chown -R appuser:appuser /app
+# keys/          — OAuth2 client_secret files (one per Gmail project), read-only
+# tokens/        — OAuth2 token cache (one file per account), writable
+RUN mkdir -p /app/data /app/keys /app/tokens && chown -R appuser:appuser /app
 
 USER appuser
 

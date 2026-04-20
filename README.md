@@ -30,7 +30,7 @@ A resilient IMAP bridge that streams emails from multiple source accounts into a
 ```bash
 git clone https://github.com/lamclennan/imap-bridge.git
 cd imap-bridge
-mkdir -p data tokens
+mkdir -p data tokens keys
 ```
 
 ### 2. Configure
@@ -66,6 +66,17 @@ cp config.example.json config.json
 }
 ```
 
+**Outlook.com / Hotmail** — standard IMAP with an app password (generate one at account.microsoft.com → Security → App passwords):
+
+```json
+{
+  "host":     "imap-mail.outlook.com:993",
+  "user":     "you@outlook.com",
+  "pass":     "app-password-here",
+  "security": "ssl"
+}
+```
+
 **Gmail accounts** — set `"provider": "gmail"` and omit `pass`:
 
 ```json
@@ -74,21 +85,30 @@ cp config.example.json config.json
   "user":             "you@gmail.com",
   "security":         "ssl",
   "provider":         "gmail",
-  "credentials_file": "client_secret.json",
+  "credentials_file": "keys/client_secret_you.json",
   "token_file":       "tokens/token_you.json"
 }
 ```
 
-### 3. Gmail OAuth2 setup (first time only)
+### 3. Gmail OAuth2 setup (first time per account)
 
-1. In [Google Cloud Console](https://console.cloud.google.com/), create a project, enable the **Gmail API**, create an **OAuth 2.0 Desktop** credential, and download `client_secret.json` to the project root.
-2. Run the interactive auth flow:
+1. In [Google Cloud Console](https://console.cloud.google.com/), create a project, enable the **Gmail API**, create an **OAuth 2.0 Desktop** credential, and download the JSON file to `./keys/` — name it clearly, e.g. `keys/client_secret_archive.json`.
+2. Run the interactive auth flow for each Gmail account:
    ```bash
    docker compose run --rm imap-bridge
    ```
-3. Open the printed URL, grant access, paste the code back. Token is written to `tokens/` and refreshed automatically — you only do this once per account.
+3. Open the printed URL, grant access, paste the code back. The token is written to `tokens/` and refreshed automatically — you only do this once per account.
 
-> Each Gmail account needs its own `token_file` path.
+**Multiple Gmail accounts** — each account needs its own `credentials_file` and `token_file`:
+
+```json
+{ "credentials_file": "keys/client_secret_archive.json", "token_file": "tokens/token_archive.json" }
+{ "credentials_file": "keys/client_secret_work.json",    "token_file": "tokens/token_work.json"    }
+```
+
+You can reuse the same `credentials_file` across multiple accounts if they share a Google Cloud project. Each account always needs its own `token_file`.
+
+> The `keys/` folder is mounted read-only. The `tokens/` folder is writable so refreshed tokens can be persisted.
 
 ### 4. Run
 
@@ -103,6 +123,7 @@ docker logs -f imap-bridge
 
 | Field | Scope | Description |
 |---|---|---|
+| `debug` | top-level | `true` to enable verbose per-message logging; default `false` |
 | `host` | source / dest | `hostname:port` |
 | `user` | source / dest | IMAP username / email address |
 | `pass` | source / dest | Password or app password (omit for Gmail) |
@@ -112,7 +133,11 @@ docker logs -f imap-bridge
 | `credentials_file` | source / dest | Path to Google OAuth2 `client_secret.json` |
 | `token_file` | source / dest | Path to cached OAuth2 token (unique per account) |
 | `report_label` | dest only | Folder for daily error digest; empty = disabled |
-| `retention_days` | source only | Prune source messages older than N days; `0` = keep forever |
+| `retention_days` | source only | `-1` = sync full history, never prune; `0` = keep forever (eligible for `sync_new_only`); `>0` = prune source messages older than N days |
+| `disable_idle` | source only | `true` to disable IMAP IDLE and use polling only; use when server IDLE is broken |
+| `poll_interval` | source only | Poll interval in seconds when IDLE is disabled or falls back; default `600` |
+| `sync_new_only` | source only | On first run, skip all existing mail and only sync new messages arriving after startup. Only applies when `retention_days` is `0`. |
+| `max_error_retention_days` | source only | Stop retrying permanently skipped messages after N days; `0` = retry forever. Skipped messages appear in the daily report until expired or resolved. |
 | `mappings` | source only | `[{ "from": "...", "to": ["dest1", "dest2"], "labels": ["tag"] }]` — `to` is an array; `labels` is optional — see below |
 
 ---
@@ -147,7 +172,39 @@ Deduplication is tracked per `(message-id, destination-folder)` pair so the same
 
 ---
 
-## 🗂️ Discovering folder names
+## ⚠️ Gmail IMAP limits — this is not a migration tool
+
+Gmail enforces IMAP bandwidth limits per account:
+
+- **~2,500 MB per day** download limit for IMAP clients
+- **~500 MB per day** upload limit via IMAP APPEND
+- Exceeding limits results in temporary `[OVERQUOTA]` or authentication errors for several hours
+
+This bridge is designed for **continuous low-volume mirroring** of ongoing mail — not bulk import of historical mailboxes. If you have a large existing mailbox to migrate, use a dedicated migration tool first, then enable this bridge for ongoing sync going forward.
+
+Use `sync_new_only: true` when setting up a new source with an existing inbox to avoid triggering rate limits on first run.
+
+---
+
+If a message fails to sync after `5` consecutive attempts it is permanently skipped so subsequent mail is not blocked. The daily report will include the skipped message every day until it is resolved.
+
+**Automatic daily retry:** At 07:00 each day the bridge resets skipped messages so they are retried. If the message was deleted from the source mailbox, the next sync will find it gone and the failure record is cleared automatically. No manual intervention needed in the normal case.
+
+**`max_error_retention_days`:** After this many days the failure record is deleted and the message will no longer be retried or shown in reports. Useful for messages that are permanently undeliverable.
+
+**Manual clear via sqlite3** (if needed):
+```bash
+# View all skipped messages
+sqlite3 data/state.db "SELECT key, skipped_at, last_error FROM sync_failures WHERE skipped_at IS NOT NULL;"
+
+# Clear all — retry everything on next sync
+sqlite3 data/state.db "DELETE FROM sync_failures;"
+
+# Clear one specific message
+sqlite3 data/state.db "DELETE FROM sync_failures WHERE key='user@example.com:INBOX:3605';"
+```
+
+---
 
 If you're unsure of the exact folder names on a source or destination server,
 leave `mappings` as an empty array for that source in `config.json`:
@@ -219,7 +276,9 @@ Once you've identified the folder names, add your `mappings` and restart.
 ## 🐳 Docker notes
 
 * SQLite state in `./data/state.db` (persistent volume)
-* `config.json`, `client_secret.json`, and `tokens/` mounted from project root
+* `config.json` mounted read-only from project root
+* `./keys/` mounted read-only — place all `client_secret_*.json` files here
+* `./tokens/` mounted writable — one token file per Gmail account, auto-refreshed
 * Log rotation: 10 MB × 3 files
 * Non-root user inside container
 

@@ -12,6 +12,7 @@ import (
 	"math/rand"
 	"os"
 	"os/signal"
+	"regexp"
 	"strings"
 	"sync"
 	"syscall"
@@ -25,11 +26,22 @@ import (
 	"golang.org/x/oauth2/google"
 )
 
+// ---------- Debug ----------
+
+var debugEnabled bool
+
+func debugLog(format string, args ...any) {
+	if debugEnabled {
+		log.Printf("DEBUG "+format, args...)
+	}
+}
+
 // ---------- Config ----------
 
 type Config struct {
 	Destination DestConfig     `json:"destination"`
 	Sources     []SourceConfig `json:"sources"`
+	Debug       bool           `json:"debug"` // enable verbose per-message logging
 }
 
 type DestConfig struct {
@@ -47,13 +59,17 @@ type DestConfig struct {
 }
 
 type SourceConfig struct {
-	Host          string      `json:"host"`
-	User          string      `json:"user"`
-	Pass          string      `json:"pass"`
-	Security      string      `json:"security"`
-	SkipVerify    bool        `json:"skip_verify"`
-	RetentionDays int         `json:"retention_days"` // 0 = keep forever, >0 = prune after N days
-	Mappings      []FolderMap `json:"mappings"`
+	Host                 string      `json:"host"`
+	User                 string      `json:"user"`
+	Pass                 string      `json:"pass"`
+	Security             string      `json:"security"`
+	SkipVerify           bool        `json:"skip_verify"`
+	RetentionDays        int         `json:"retention_days"`         // 0 = keep forever, >0 = prune after N days
+	DisableIdle          bool        `json:"disable_idle"`           // fall back to polling; use when server IDLE is broken
+	PollInterval         int         `json:"poll_interval"`          // poll interval in seconds when idle disabled or falls back; default 600
+	SyncNewOnly          bool        `json:"sync_new_only"`          // on first run, skip existing mail and only sync new messages
+	MaxErrorRetentionDays int        `json:"max_error_retention_days"` // stop retrying skipped messages after N days; 0 = retry forever
+	Mappings             []FolderMap `json:"mappings"`
 
 	// Gmail OAuth2
 	Provider        string `json:"provider"`
@@ -184,6 +200,13 @@ func initDB(path string) *sql.DB {
 	CREATE TABLE IF NOT EXISTS sync_state (
 		msgid      TEXT PRIMARY KEY,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+	CREATE TABLE IF NOT EXISTS sync_failures (
+		key        TEXT PRIMARY KEY,  -- account:folder:uid
+		msgid      TEXT,
+		failures   INTEGER DEFAULT 0,
+		last_error TEXT,
+		skipped_at DATETIME
 	);`)
 	if err != nil {
 		log.Fatal("DB init failed:", err)
@@ -220,10 +243,16 @@ func loadOAuthToken(credFile, tokenFile string) (*oauth2.Token, *oauth2.Config, 
 		}
 	}
 	authURL := cfg.AuthCodeURL("state-token", oauth2.AccessTypeOffline)
-	fmt.Printf("\nOpen this URL to authorise Gmail access:\n%s\n\nPaste the code: ", authURL)
-	var code string
-	if _, err := fmt.Scan(&code); err != nil {
+	fmt.Printf("\nOpen this URL to authorise Gmail access:\n%s\n\nPaste the code or full redirect URL: ", authURL)
+	var input string
+	if _, err := fmt.Scan(&input); err != nil {
 		return nil, nil, fmt.Errorf("read auth code: %w", err)
+	}
+	// Accept either a bare code or the full redirect URL that Google sends back
+	// (e.g. http://localhost/?code=4/0AX...&scope=...). Parse out the code param.
+	code := input
+	if m := regexp.MustCompile(`[?&]code=([^&]+)`).FindStringSubmatch(input); m != nil {
+		code = m[1]
 	}
 	tok, err := cfg.Exchange(context.Background(), code)
 	if err != nil {
@@ -310,6 +339,11 @@ func connectAndLogin(
 
 const maxDestAttempts = 8
 
+// maxMsgAttempts is the number of consecutive sync failures before a message
+// is permanently skipped. Prevents a single poison message from blocking all
+// subsequent mail in the same folder.
+const maxMsgAttempts = 5
+
 // DestClient is a single shared, thread-safe IMAP append connection with
 // automatic reconnection. All source workers and the reporter use the same instance.
 type DestClient struct {
@@ -346,6 +380,11 @@ func (d *DestClient) ensureConn() error {
 	return d.redial()
 }
 
+// errDestDown is returned by appendGetUID when the destination cannot be
+// reached after all retries. Distinct from a message-level rejection so
+// syncFolder can abort the entire pass rather than burning failure counts.
+var errDestDown = fmt.Errorf("destination unreachable")
+
 // Append delivers r to label with flags, retrying with exponential backoff.
 // flags should reflect the source message's read state (\Seen or empty).
 // Pass an explicit empty slice []string{} to force delivery as unread.
@@ -357,9 +396,11 @@ func (d *DestClient) Append(ctx context.Context, label string, flags []string, r
 // appendGetUID appends r to label and returns the UID assigned by the server
 // via the UIDPLUS APPENDUID response code (RFC 4315). Returns uid=0 if the
 // server does not advertise UIDPLUS or omits the code — label STORE is skipped
-// in that case. Uses c.Execute directly so the tagged OK StatusResp is
-// accessible; no external uidplus package required.
+// in that case. Returns errDestDown if the destination cannot be reached after
+// all retries, so the caller can abort the sync pass without burning per-message
+// failure counts.
 func (d *DestClient) appendGetUID(ctx context.Context, label string, flags []string, r imap.Literal) (uid uint32, err error) {
+	connFails := 0
 	for attempt := 0; attempt < maxDestAttempts; attempt++ {
 		if ctx.Err() != nil {
 			return 0, ctx.Err()
@@ -369,6 +410,7 @@ func (d *DestClient) appendGetUID(ctx context.Context, label string, flags []str
 		connErr := d.ensureConn()
 		if connErr != nil {
 			d.mu.Unlock()
+			connFails++
 			wait := backoff(attempt)
 			errLog.add("dest connect error (attempt %d/%d): %v — retry in %s",
 				attempt+1, maxDestAttempts, connErr, wait)
@@ -383,19 +425,6 @@ func (d *DestClient) appendGetUID(ctx context.Context, label string, flags []str
 		appendErr := d.c.Append(label, flags, time.Now(), r)
 		var appendUID uint32
 		if appendErr == nil {
-			// UIDPLUS servers return [APPENDUID validity uid] in the tagged OK.
-			// go-imap v1 exposes this via the MailboxStatus after a successful
-			// Append when the server sends APPENDUID. We read it from the
-			// mailbox status UIDNEXT shortcut: select the mailbox and read back
-			// the last assigned UID via STATUS UIDNEXT-1.
-			// Simpler: parse directly from the StatusResp code.
-			// go-imap's Append() swallows the StatusResp internally, but the
-			// APPENDUID code is also delivered as a StatusUpdate on the Updates
-			// channel when c.Updates is set.
-			//
-			// Since c.Updates is nil here (we don't set it on the dest client),
-			// we use STATUS UIDNEXT as a reliable fallback: the just-appended
-			// message UID == UIDNEXT - 1.
 			if status, serr := d.c.Status(label, []imap.StatusItem{imap.StatusUidNext}); serr == nil && status.UidNext > 0 {
 				appendUID = status.UidNext - 1
 			}
@@ -419,6 +448,13 @@ func (d *DestClient) appendGetUID(ctx context.Context, label string, flags []str
 		}
 	}
 
+	// If every attempt was a connection failure (never got a response from the
+	// server), return errDestDown so the caller aborts the sync pass cleanly.
+	// If at least one attempt connected but the server rejected the message,
+	// return a regular error so the failure counter is incremented.
+	if connFails == maxDestAttempts {
+		return 0, errDestDown
+	}
 	return 0, fmt.Errorf("dest: exhausted %d attempts appending to %q", maxDestAttempts, label)
 }
 
@@ -559,7 +595,8 @@ func (lw *LabelWorker) Run(ctx context.Context) {
 // ---------- Retention pruner ----------
 
 // pruneFolder marks messages older than retentionDays as \Deleted and expunges them.
-// No-op when retentionDays is 0. Called on source folders only, never destination.
+// No-op when retentionDays <= 0. retentionDays=-1 means sync all history, never prune.
+// Called on source folders only, never destination.
 func pruneFolder(ctx context.Context, c *client.Client, user, folder string, retentionDays int) {
 	if retentionDays <= 0 || ctx.Err() != nil {
 		return
@@ -606,11 +643,22 @@ func pruneFolder(ctx context.Context, c *client.Client, user, folder string, ret
 // When to has a single entry the body literal is streamed directly with no
 // buffering. When to has multiple entries the body is read into memory once
 // and replayed — unavoidable since an io.Reader can only be consumed once.
-func syncFolder(ctx context.Context, c *client.Client, dest *DestClient, lw *LabelWorker, db *sql.DB, user, folder string, to, labels []string) {
+func syncFolder(ctx context.Context, c *client.Client, dest *DestClient, lw *LabelWorker, db *sql.DB, user, folder string, to, labels []string, syncNewOnly bool, retentionDays int) (allDelivered bool) {
 	key := user + ":" + folder
 
 	var lastUID uint32
 	_ = db.QueryRow("SELECT last_uid FROM folder_offsets WHERE account_folder = ?", key).Scan(&lastUID)
+
+	// First run with sync_new_only: skip all existing mail by initialising the
+	// offset to the current highest UID. Only applies when retention_days=0 —
+	// with retention enabled (>0 or -1) you want historical mail.
+	if lastUID == 0 && syncNewOnly && retentionDays == 0 {
+		if status, err := c.Status(folder, []imap.StatusItem{imap.StatusUidNext}); err == nil && status.UidNext > 1 {
+			lastUID = status.UidNext - 1
+			_, _ = db.Exec("INSERT OR REPLACE INTO folder_offsets VALUES (?, ?)", key, lastUID)
+			log.Printf("sync_new_only: %s/%s initialised at UID %d — existing mail skipped", user, folder, lastUID)
+		}
+	}
 
 	criteria := imap.NewSearchCriteria()
 	if lastUID > 0 {
@@ -622,18 +670,16 @@ func syncFolder(ctx context.Context, c *client.Client, dest *DestClient, lw *Lab
 	uids, err := c.UidSearch(criteria)
 	if err != nil {
 		errLog.add("UID search error on %s/%s: %v", user, folder, err)
-		return
+		return false
 	}
-	log.Printf("DEBUG syncFolder %s/%s: lastUID=%d found=%d uids", user, folder, lastUID, len(uids))
+	debugLog("syncFolder %s/%s: lastUID=%d found=%d uids", user, folder, lastUID, len(uids))
 
+	allDelivered = true
 	var maxUID uint32
 
 	for _, uid := range uids {
 		if ctx.Err() != nil {
 			return
-		}
-		if uid > maxUID {
-			maxUID = uid
 		}
 
 		set := new(imap.SeqSet)
@@ -672,13 +718,13 @@ func syncFolder(ctx context.Context, c *client.Client, dest *DestClient, lw *Lab
 		for _, dst := range to {
 			dedupKey := id + "\x00" + dst
 			if cacheSeen(dedupKey) {
-				log.Printf("DEBUG uid=%d id=%q dst=%q — skipped (cache)", uid, id, dst)
+				debugLog("uid=%d id=%q dst=%q — skipped (cache)", uid, id, dst)
 				continue
 			}
 			var exists string
 			_ = db.QueryRow("SELECT msgid FROM sync_state WHERE msgid = ?", dedupKey).Scan(&exists)
 			if exists != "" {
-				log.Printf("DEBUG uid=%d id=%q dst=%q — skipped (db)", uid, id, dst)
+				debugLog("uid=%d id=%q dst=%q — skipped (db)", uid, id, dst)
 				cacheAdd(dedupKey)
 				continue
 			}
@@ -686,6 +732,40 @@ func syncFolder(ctx context.Context, c *client.Client, dest *DestClient, lw *Lab
 		}
 		if len(pending) == 0 {
 			continue
+		}
+
+		// Check failure record. If skipped_at is set, still in holdoff — advance past it.
+		// If the record exists but skipped_at is NULL, it's queued for retry today.
+		// In both cases, first verify the UID still exists on source — if the user
+		// deleted the message the failure clears itself automatically.
+		failKey := fmt.Sprintf("%s:%s:%d", user, folder, uid)
+		var failureCount int
+		var skippedAt sql.NullString
+		_ = db.QueryRow("SELECT failures, skipped_at FROM sync_failures WHERE key = ?", failKey).Scan(&failureCount, &skippedAt)
+		if failureCount > 0 {
+			// Verify message still exists on source.
+			existsSet := new(imap.SeqSet)
+			existsSet.AddNum(uid)
+			existsCh := make(chan *imap.Message, 1)
+			go c.UidFetch(existsSet, []imap.FetchItem{imap.FetchUid}, existsCh)
+			existsMsg := <-existsCh
+			if existsMsg == nil {
+				// Message gone from source — clear failure record and advance offset.
+				_, _ = db.Exec("DELETE FROM sync_failures WHERE key = ?", failKey)
+				if uid > maxUID {
+					maxUID = uid
+				}
+				debugLog("uid=%d auto-cleared from failures — no longer on source", uid)
+				continue
+			}
+			if skippedAt.Valid {
+				// Still in holdoff — advance past it without retrying.
+				if uid > maxUID {
+					maxUID = uid
+				}
+				continue
+			}
+			// skipped_at is NULL — daily retry has reset it, fall through to attempt delivery.
 		}
 
 		// Fetch body.
@@ -715,6 +795,8 @@ func syncFolder(ctx context.Context, c *client.Client, dest *DestClient, lw *Lab
 			}
 		}
 
+		msgDelivered := true
+		var lastAppendErr string
 		for _, dst := range pending {
 			if ctx.Err() != nil {
 				return
@@ -727,12 +809,21 @@ func syncFolder(ctx context.Context, c *client.Client, dest *DestClient, lw *Lab
 				appendUID, appendErr = dest.appendGetUID(ctx, dst, destFlags, literal)
 			}
 			if appendErr != nil {
+				if appendErr == errDestDown {
+					// Destination is unreachable — abort this entire sync pass.
+					// Don't increment failure counters; this is an infrastructure
+					// problem not a message problem.
+					errLog.add("sync aborted for %s/%s — destination unreachable", user, folder)
+					allDelivered = false
+					return
+				}
 				errLog.add("append failed for msg %s → %q (%s/%s): %v", id, dst, user, folder, appendErr)
+				msgDelivered = false
+				allDelivered = false
+				lastAppendErr = appendErr.Error()
 				continue
 			}
-			log.Printf("DEBUG uid=%d id=%q → %q appended OK (destUID=%d)", uid, id, dst, appendUID)
-			// For Gmail destinations with labels, enqueue a X-GM-LABELS STORE
-			// to the dedicated label worker.
+			debugLog("uid=%d id=%q → %q appended OK (destUID=%d)", uid, id, dst, appendUID)
 			if lw != nil && len(labels) > 0 {
 				lw.Enqueue(dst, appendUID, labels, id)
 			}
@@ -740,11 +831,37 @@ func syncFolder(ctx context.Context, c *client.Client, dest *DestClient, lw *Lab
 			_, _ = db.Exec("INSERT INTO sync_state (msgid) VALUES (?)", dedupKey)
 			cacheAdd(dedupKey)
 		}
+		// Only advance the UID offset if every destination for this message
+		// was delivered. If any failed, increment the failure counter.
+		// After maxMsgAttempts, permanently skip the message so it doesn't
+		// block all subsequent mail.
+		if msgDelivered && uid > maxUID {
+			maxUID = uid
+			// Clear any prior failure record on success.
+			_, _ = db.Exec("DELETE FROM sync_failures WHERE key = ?", failKey)
+		} else if !msgDelivered {
+			var failures int
+			_ = db.QueryRow("SELECT failures FROM sync_failures WHERE key = ?", failKey).Scan(&failures)
+			failures++
+			if failures >= maxMsgAttempts {
+				_, _ = db.Exec(`INSERT OR REPLACE INTO sync_failures (key, msgid, failures, last_error, skipped_at)
+					VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)`, failKey, id, failures, lastAppendErr)
+				errLog.add("SKIPPED uid=%d (%s/%s) after %d failed attempts — message will not be retried; last error: %s",
+					uid, user, folder, failures, lastAppendErr)
+				if uid > maxUID {
+					maxUID = uid
+				}
+			} else {
+				_, _ = db.Exec(`INSERT OR REPLACE INTO sync_failures (key, msgid, failures, last_error)
+					VALUES (?, ?, ?, ?)`, failKey, id, failures, lastAppendErr)
+			}
+		}
 	}
 
 	if maxUID > 0 {
 		_, _ = db.Exec("INSERT OR REPLACE INTO folder_offsets VALUES (?, ?)", key, maxUID)
 	}
+	return allDelivered
 }
 
 // ---------- Source worker ----------
@@ -811,9 +928,11 @@ func runMappings(ctx context.Context, c *client.Client, src SourceConfig, dest *
 				return false
 			}
 
-			syncFolder(ctx, c, dest, lw, db, src.User, m.From, m.To, m.Labels)
+			syncOK := syncFolder(ctx, c, dest, lw, db, src.User, m.From, m.To, m.Labels, src.SyncNewOnly, src.RetentionDays)
 
-			if src.RetentionDays > 0 {
+			// Only prune if all messages were delivered successfully.
+			// If any append failed, skip pruning to avoid deleting undelivered mail.
+			if syncOK && src.RetentionDays > 0 {
 				pruneFolder(ctx, c, src.User, m.From, src.RetentionDays)
 			}
 		}
@@ -822,9 +941,23 @@ func runMappings(ctx context.Context, c *client.Client, src SourceConfig, dest *
 			return true
 		}
 
-		// After syncing all folders, IDLE on the first mapping's folder to
-		// receive push notifications for new mail. Fall back to a 10-minute
-		// poll if the server doesn't support IDLE.
+		// Determine poll interval — default 600s (10 min).
+		pollInterval := time.Duration(src.PollInterval) * time.Second
+		if pollInterval <= 0 {
+			pollInterval = 10 * time.Minute
+		}
+
+		if src.DisableIdle {
+			// Pure polling mode — just wait the poll interval then re-sync.
+			select {
+			case <-time.After(pollInterval):
+			case <-ctx.Done():
+				return true
+			}
+			continue
+		}
+
+		// IDLE mode — select first folder and wait for push notification.
 		if len(src.Mappings) > 0 {
 			if _, err := c.Select(src.Mappings[0].From, false); err != nil {
 				errLog.add("select %q for idle failed on %s: %v — reconnecting", src.Mappings[0].From, src.Host, err)
@@ -844,7 +977,6 @@ func runMappings(ctx context.Context, c *client.Client, src SourceConfig, dest *
 		select {
 		case <-updates:
 			// Server pushed an EXISTS or RECENT — new mail arrived.
-			// Signal IDLE to stop, wait for the goroutine to finish.
 			close(idleDone)
 			if err := <-idleErr; err != nil {
 				errLog.add("idle error on %s: %v — reconnecting", src.Host, err)
@@ -853,14 +985,25 @@ func runMappings(ctx context.Context, c *client.Client, src SourceConfig, dest *
 			}
 
 		case err := <-idleErr:
-			// IDLE returned on its own (server closed it, or not supported).
+			// IDLE returned on its own (server closed it or doesn't support it).
 			if err != nil {
 				errLog.add("idle ended on %s: %v — reconnecting", src.Host, err)
 				c.Updates = nil
 				return false
 			}
+			// Brief holdoff to avoid spinning when IDLE is broken.
+			holdoff := 20 * time.Second
+			if pollInterval < holdoff {
+				holdoff = pollInterval
+			}
+			select {
+			case <-time.After(holdoff):
+			case <-ctx.Done():
+				c.Updates = nil
+				return true
+			}
 
-		case <-time.After(10 * time.Minute):
+		case <-time.After(pollInterval):
 			// Keepalive: exit IDLE, send NOOP, then re-sync.
 			close(idleDone)
 			<-idleErr
@@ -885,7 +1028,7 @@ func runMappings(ctx context.Context, c *client.Client, src SourceConfig, dest *
 
 // buildReportEmail constructs a minimal plain-text RFC 5322 digest.
 // Always delivered unread regardless of any config setting.
-func buildReportEmail(destUser string, entries []*errorEntry) imap.Literal {
+func buildReportEmail(destUser string, entries []*errorEntry, db *sql.DB) imap.Literal {
 	now := time.Now()
 	var b strings.Builder
 
@@ -897,9 +1040,47 @@ func buildReportEmail(destUser string, entries []*errorEntry) imap.Literal {
 	b.WriteString("MIME-Version: 1.0\r\n")
 	b.WriteString("\r\n")
 
+	// Always show permanently skipped messages so they stay visible every day.
+	type skippedRow struct {
+		key       string
+		msgid     string
+		failures  int
+		lastError string
+		skippedAt string
+	}
+	var skipped []skippedRow
+	if db != nil {
+		rows, err := db.Query(`SELECT key, msgid, failures, last_error, skipped_at
+			FROM sync_failures WHERE skipped_at IS NOT NULL ORDER BY skipped_at`)
+		if err == nil {
+			defer rows.Close()
+			for rows.Next() {
+				var r skippedRow
+				_ = rows.Scan(&r.key, &r.msgid, &r.failures, &r.lastError, &r.skippedAt)
+				skipped = append(skipped, r)
+			}
+		}
+	}
+
+	if len(skipped) > 0 {
+		b.WriteString(fmt.Sprintf("⚠️  %d permanently skipped message(s) — action required:\r\n\r\n", len(skipped)))
+		for _, r := range skipped {
+			b.WriteString(fmt.Sprintf("  key:       %s\r\n", r.key))
+			b.WriteString(fmt.Sprintf("  msg-id:    %s\r\n", r.msgid))
+			b.WriteString(fmt.Sprintf("  skipped:   %s\r\n", r.skippedAt))
+			b.WriteString(fmt.Sprintf("  reason:    %s\r\n\r\n", r.lastError))
+		}
+		b.WriteString("To clear and retry all skipped messages:\r\n")
+		b.WriteString("  sqlite3 data/state.db \"DELETE FROM sync_failures;\"\r\n")
+		b.WriteString("To clear a specific message:\r\n")
+		b.WriteString("  sqlite3 data/state.db \"DELETE FROM sync_failures WHERE key='account:folder:uid';\"\r\n\r\n")
+	}
+
 	if len(entries) == 0 {
-		b.WriteString("No errors or warnings in the past 24 hours.\r\n")
-		b.WriteString("All sources are syncing cleanly.\r\n")
+		if len(skipped) == 0 {
+			b.WriteString("No errors or warnings in the past 24 hours.\r\n")
+			b.WriteString("All sources are syncing cleanly.\r\n")
+		}
 	} else {
 		b.WriteString(fmt.Sprintf("%d distinct issue(s) in the past 24 hours:\r\n\r\n", len(entries)))
 		for _, e := range entries {
@@ -924,9 +1105,57 @@ func nextReportTime() time.Time {
 	return t
 }
 
-// runReporter fires at 07:00 local time each day, drains the error buffer,
-// and appends a digest email to report_label. Disabled if report_label is empty.
-func runReporter(ctx context.Context, dest *DestClient, destConf DestConfig) {
+// resetDailyRetries clears skipped_at on all sync_failures records so they
+// are retried on the next sync pass. Records older than maxDays (per source
+// config) are deleted entirely and their folder offset is advanced past them
+// so they are not found again.
+func resetDailyRetries(db *sql.DB, sources []SourceConfig) {
+	// Expire records that have exceeded their source's max_error_retention_days.
+	for _, src := range sources {
+		if src.MaxErrorRetentionDays <= 0 {
+			continue
+		}
+		prefix := src.User + ":"
+		// Find expired records so we can advance the folder offset past them.
+		rows, err := db.Query(`SELECT key FROM sync_failures
+			WHERE key LIKE ? AND skipped_at IS NOT NULL
+			AND julianday('now') - julianday(skipped_at) > ?`,
+			prefix+"%", src.MaxErrorRetentionDays)
+		if err == nil {
+			for rows.Next() {
+				var key string
+				if rows.Scan(&key) != nil {
+					continue
+				}
+				// key format: user:folder:uid — parse out folder and uid
+				// and advance folder_offsets if this uid is beyond current offset.
+				parts := strings.SplitN(key, ":", 3) // [user, folder, uid]
+				if len(parts) == 3 {
+					var uid uint32
+					if _, err := fmt.Sscanf(parts[2], "%d", &uid); err == nil {
+						folderKey := parts[0] + ":" + parts[1]
+						var lastUID uint32
+						_ = db.QueryRow("SELECT last_uid FROM folder_offsets WHERE account_folder = ?", folderKey).Scan(&lastUID)
+						if uid > lastUID {
+							_, _ = db.Exec("INSERT OR REPLACE INTO folder_offsets VALUES (?, ?)", folderKey, uid)
+						}
+					}
+				}
+			}
+			rows.Close()
+		}
+		_, _ = db.Exec(`DELETE FROM sync_failures
+			WHERE key LIKE ? AND skipped_at IS NOT NULL
+			AND julianday('now') - julianday(skipped_at) > ?`,
+			prefix+"%", src.MaxErrorRetentionDays)
+	}
+	// Reset skipped_at on all remaining records so they are retried today.
+	_, _ = db.Exec(`UPDATE sync_failures SET skipped_at = NULL WHERE skipped_at IS NOT NULL`)
+}
+// runReporter fires at 07:00 local time each day, resets skipped message retry
+// flags, drains the error buffer, and appends a digest email to report_label.
+// Disabled if report_label is empty.
+func runReporter(ctx context.Context, dest *DestClient, destConf DestConfig, db *sql.DB, sources []SourceConfig) {
 	if destConf.ReportLabel == "" {
 		log.Println("report_label not configured — daily report disabled")
 		return
@@ -944,8 +1173,12 @@ func runReporter(ctx context.Context, dest *DestClient, destConf DestConfig) {
 			return
 		}
 
+		// Expire old failures and reset skipped_at so messages are retried today.
+		// Report is built after reset so it reflects what will be retried.
+		resetDailyRetries(db, sources)
+
 		entries := errLog.drain()
-		msg := buildReportEmail(destConf.User, entries)
+		msg := buildReportEmail(destConf.User, entries, db)
 
 		// Explicit empty flags — report always lands unread to catch your eye.
 		if err := dest.Append(ctx, destConf.ReportLabel, []string{}, msg); err != nil {
@@ -1003,6 +1236,11 @@ func main() {
 	}
 	f.Close()
 
+	debugEnabled = conf.Debug
+	if debugEnabled {
+		log.Println("debug logging enabled")
+	}
+
 	// Folder discovery: if any source has no mappings, log both that source's
 	// folder list and the destination's folder list, then exit. This lets the
 	// user see exact folder names in docker logs before writing their config.
@@ -1055,7 +1293,7 @@ func main() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		runReporter(ctx, dest, conf.Destination)
+		runReporter(ctx, dest, conf.Destination, db, conf.Sources)
 	}()
 
 	for _, src := range conf.Sources {
