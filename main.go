@@ -453,18 +453,31 @@ func (d *DestClient) appendGetUID(ctx context.Context, label string, flags []str
 		status, execErr := d.c.Execute(cmd, nil)
 
 		if execErr != nil {
-			// Server NO/BAD response — connection is still alive, don't count
-			// as connection failure. Any other error is a connection-level fault.
-			if _, isServerResp := execErr.(*imap.StatusResp); !isServerResp {
-				_ = d.c.Logout()
-				d.c = nil
-				d.hasUIDPLUS = false
-				connFails++
-			}
+			// Execute only returns non-nil err on network-level failures.
+			// These are always connection faults — mark conn dead and count.
+			_ = d.c.Logout()
+			d.c = nil
+			d.hasUIDPLUS = false
+			connFails++
 			d.mu.Unlock()
 			wait := backoff(attempt)
 			errLog.add("dest append error (attempt %d/%d): %v — retry in %s",
 				attempt+1, maxDestAttempts, execErr, wait)
+			select {
+			case <-time.After(wait):
+			case <-ctx.Done():
+				return 0, ctx.Err()
+			}
+			continue
+		}
+
+		// Execute returned nil err. Check status for server-level NO/BAD.
+		// These are message-level rejections — connection stays alive.
+		if status != nil && (status.Type == imap.StatusRespNo || status.Type == imap.StatusRespBad) {
+			d.mu.Unlock()
+			wait := backoff(attempt)
+			errLog.add("dest append rejected (attempt %d/%d): %s %s — retry in %s",
+				attempt+1, maxDestAttempts, status.Type, status.Info, wait)
 			select {
 			case <-time.After(wait):
 			case <-ctx.Done():
@@ -912,11 +925,24 @@ func syncFolder(ctx context.Context, c *client.Client, dest *DestClient, lw *Lab
 // Connects, syncs all mappings, watches for new mail, reconnects on failure.
 // No goto — uses a clean helper function for the connected phase.
 func monitorSource(ctx context.Context, src SourceConfig, dest *DestClient, lw *LabelWorker, db *sql.DB) {
-	attempt := 0
+	attempt := 0 // connect-failure backoff counter
+	reconnect := 0 // counts rapid reconnects (connection established but lost quickly)
 
 	for {
 		if ctx.Err() != nil {
 			return
+		}
+
+		// If we're reconnecting after a short-lived connection, apply backoff
+		// to avoid spinning when the server accepts TCP but fails on commands.
+		if reconnect > 0 {
+			wait := backoff(reconnect)
+			errLog.add("source reconnecting %s (attempt %d) — retry in %s", src.Host, reconnect, wait)
+			select {
+			case <-time.After(wait):
+			case <-ctx.Done():
+				return
+			}
 		}
 
 		c, _, _, err := connectAndLogin(
@@ -934,6 +960,7 @@ func monitorSource(ctx context.Context, src SourceConfig, dest *DestClient, lw *
 				return
 			}
 			attempt++
+			reconnect = 0
 			continue
 		}
 
@@ -944,6 +971,7 @@ func monitorSource(ctx context.Context, src SourceConfig, dest *DestClient, lw *
 			return
 		}
 		log.Printf("connection lost to %s — reconnecting", src.Host)
+		reconnect++
 	}
 }
 
