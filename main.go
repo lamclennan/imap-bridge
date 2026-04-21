@@ -448,7 +448,7 @@ func (d *DestClient) appendGetUID(ctx context.Context, label string, flags []str
 		cmd := &commands.Append{
 			Mailbox: label,
 			Flags:   flags,
-			Date:    time.Now(),
+			Date:	time.Now(),
 			Message: r,
 		}
 		status, execErr := d.c.Execute(cmd, nil)
@@ -487,14 +487,29 @@ func (d *DestClient) appendGetUID(ctx context.Context, label string, flags []str
 			continue
 		}
 
-		// Append succeeded. Extract APPENDUID if UIDPLUS is supported.
+		// Append succeeded. Extract APPENDUID (Gmail sometimes returns it as string).
 		appendUID := uint32(0)
-		if d.hasUIDPLUS && status != nil &&
-			strings.EqualFold(string(status.Code), "APPENDUID") &&
-			len(status.Arguments) >= 2 {
-			if v, ok := status.Arguments[1].(uint32); ok {
+		if status != nil && strings.EqualFold(string(status.Code), "APPENDUID") && len(status.Arguments) >= 2 {
+			raw := status.Arguments[1]
+			switch v := raw.(type) {
+			case uint32:
 				appendUID = v
+				debugLog("appendGetUID: UIDPLUS success → APPENDUID = %d (uint32)", appendUID)
+			case string:
+				if u, err := strconv.ParseUint(v, 10, 32); err == nil {
+					appendUID = uint32(u)
+					debugLog("appendGetUID: UIDPLUS success → APPENDUID = %d (parsed from string %q)", appendUID, v)
+				} else {
+					debugLog("appendGetUID: APPENDUID string parse failed: %v (value=%q)", err, v)
+				}
+			default:
+				debugLog("appendGetUID: APPENDUID code present but arg[1] is unexpected type (type=%T, value=%v)", raw, raw)
 			}
+		} else if status != nil {
+			debugLog("appendGetUID: no APPENDUID code received (code=%q, args=%d) — uid=0 (labels skipped if any)",
+				status.Code, len(status.Arguments))
+		} else {
+			debugLog("appendGetUID: status was nil — uid=0 (labels skipped if any)")
 		}
 
 		d.mu.Unlock()
