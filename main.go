@@ -40,47 +40,47 @@ func debugLog(format string, args ...any) {
 // ---------- Config ----------
 
 type Config struct {
-	Destination DestConfig	 `json:"destination"`
-	Sources	 []SourceConfig `json:"sources"`
-	Debug	   bool		   `json:"debug"` // enable verbose per-message logging
+	Destination DestConfig     `json:"destination"`
+	Sources     []SourceConfig `json:"sources"`
+	Debug       bool           `json:"debug"` // enable verbose per-message logging
 }
 
 type DestConfig struct {
-	Host		string `json:"host"`
-	User		string `json:"user"`
-	Pass		string `json:"pass"`
-	Security	string `json:"security"`
+	Host        string `json:"host"`
+	User        string `json:"user"`
+	Pass        string `json:"pass"`
+	Security    string `json:"security"`
 	ReportLabel string `json:"report_label"` // folder for daily digest; empty = disabled
 	SkipVerify  bool   `json:"skip_verify"`
 
 	// Gmail OAuth2
-	Provider		string `json:"provider"`
+	Provider        string `json:"provider"`
 	CredentialsFile string `json:"credentials_file"`
-	TokenFile	   string `json:"token_file"`
+	TokenFile       string `json:"token_file"`
 }
 
 type SourceConfig struct {
-	Host				 string	  `json:"host"`
-	User				 string	  `json:"user"`
-	Pass				 string	  `json:"pass"`
-	Security			 string	  `json:"security"`
-	SkipVerify		   bool		`json:"skip_verify"`
-	RetentionDays		int		 `json:"retention_days"`		 // 0 = keep forever, >0 = prune after N days
-	DisableIdle		  bool		`json:"disable_idle"`		   // fall back to polling; use when server IDLE is broken
-	PollInterval		 int		 `json:"poll_interval"`		  // poll interval in seconds when idle disabled or falls back; default 600
-	SyncNewOnly		  bool		`json:"sync_new_only"`		  // on first run, skip existing mail and only sync new messages
-	MaxErrorRetentionDays int		`json:"max_error_retention_days"` // stop retrying skipped messages after N days; 0 = retry forever
-	Mappings			 []FolderMap `json:"mappings"`
+	Host                 string      `json:"host"`
+	User                 string      `json:"user"`
+	Pass                 string      `json:"pass"`
+	Security             string      `json:"security"`
+	SkipVerify           bool        `json:"skip_verify"`
+	RetentionDays        int         `json:"retention_days"`         // 0 = keep forever, >0 = prune after N days
+	DisableIdle          bool        `json:"disable_idle"`           // fall back to polling; use when server IDLE is broken
+	PollInterval         int         `json:"poll_interval"`          // poll interval in seconds when idle disabled or falls back; default 600
+	SyncNewOnly          bool        `json:"sync_new_only"`          // on first run, skip existing mail and only sync new messages
+	MaxErrorRetentionDays int        `json:"max_error_retention_days"` // stop retrying skipped messages after N days; 0 = retry forever
+	Mappings             []FolderMap `json:"mappings"`
 
 	// Gmail OAuth2
-	Provider		string `json:"provider"`
+	Provider        string `json:"provider"`
 	CredentialsFile string `json:"credentials_file"`
-	TokenFile	   string `json:"token_file"`
+	TokenFile       string `json:"token_file"`
 }
 
 type FolderMap struct {
 	From   string   `json:"from"`
-	To	 []string `json:"to"`			   // one or more destination folders; string or array
+	To     []string `json:"to"`               // one or more destination folders; string or array
 	Labels []string `json:"labels,omitempty"` // IMAP keywords set on append (server-dependent)
 }
 
@@ -90,9 +90,9 @@ type FolderMap struct {
 func (f *FolderMap) UnmarshalJSON(b []byte) error {
 	// Use an alias to avoid infinite recursion.
 	type Alias struct {
-		From   string		  `json:"from"`
-		To	 json.RawMessage `json:"to"`
-		Labels []string		`json:"labels,omitempty"`
+		From   string          `json:"from"`
+		To     json.RawMessage `json:"to"`
+		Labels []string        `json:"labels,omitempty"`
 	}
 	var a Alias
 	if err := json.Unmarshal(b, &a); err != nil {
@@ -116,13 +116,13 @@ func (f *FolderMap) UnmarshalJSON(b []byte) error {
 // ---------- Error log (daily digest) ----------
 
 type errorEntry struct {
-	ts	time.Time
+	ts    time.Time
 	msg   string
 	count int
 }
 
 type errorLog struct {
-	mu	  sync.Mutex
+	mu      sync.Mutex
 	entries []*errorEntry
 	index   map[string]*errorEntry // keyed by msg for deduplication
 }
@@ -196,15 +196,15 @@ func initDB(path string) *sql.DB {
 	_, err = db.Exec(`
 	CREATE TABLE IF NOT EXISTS folder_offsets (
 		account_folder TEXT PRIMARY KEY,
-		last_uid	   INTEGER
+		last_uid       INTEGER
 	);
 	CREATE TABLE IF NOT EXISTS sync_state (
-		msgid	  TEXT PRIMARY KEY,
+		msgid      TEXT PRIMARY KEY,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
 	CREATE TABLE IF NOT EXISTS sync_failures (
-		key		TEXT PRIMARY KEY,  -- account:folder:uid
-		msgid	  TEXT,
+		key        TEXT PRIMARY KEY,  -- account:folder:uid
+		msgid      TEXT,
 		failures   INTEGER DEFAULT 0,
 		last_error TEXT,
 		skipped_at DATETIME
@@ -328,7 +328,7 @@ func connectAndLogin(
 		}
 		if err := c.Authenticate(sasl.NewOAuthBearerClient(&sasl.OAuthBearerOptions{
 			Username: user,
-			Token:	accessToken,
+			Token:    accessToken,
 		})); err != nil {
 			c.Logout()
 			return nil, nil, nil, fmt.Errorf("gmail oauthbearer: %w", err)
@@ -356,8 +356,8 @@ const maxMsgAttempts = 5
 type DestClient struct {
 	conf DestConfig
 
-	mu		 sync.Mutex
-	c		  *client.Client
+	mu         sync.Mutex
+	c          *client.Client
 	oauthCfg   *oauth2.Config
 	oauthTok   *oauth2.Token
 	hasUIDPLUS bool // cached per connection; set during redial
@@ -447,7 +447,7 @@ func (d *DestClient) appendGetUID(ctx context.Context, label string, flags []str
 		cmd := &commands.Append{
 			Mailbox: label,
 			Flags:   flags,
-			Date:	time.Now(),
+			Date:    time.Now(),
 			Message: r,
 		}
 		status, execErr := d.c.Execute(cmd, nil)
@@ -486,29 +486,14 @@ func (d *DestClient) appendGetUID(ctx context.Context, label string, flags []str
 			continue
 		}
 
-		// Append succeeded. Extract APPENDUID (Gmail sometimes returns it as string).
+		// Append succeeded. Extract APPENDUID if UIDPLUS is supported.
 		appendUID := uint32(0)
-		if status != nil && strings.EqualFold(string(status.Code), "APPENDUID") && len(status.Arguments) >= 2 {
-			raw := status.Arguments[1]
-			switch v := raw.(type) {
-			case uint32:
+		if d.hasUIDPLUS && status != nil &&
+			strings.EqualFold(string(status.Code), "APPENDUID") &&
+			len(status.Arguments) >= 2 {
+			if v, ok := status.Arguments[1].(uint32); ok {
 				appendUID = v
-				debugLog("appendGetUID: UIDPLUS success → APPENDUID = %d (uint32)", appendUID)
-			case string:
-				if u, err := strconv.ParseUint(v, 10, 32); err == nil {
-					appendUID = uint32(u)
-					debugLog("appendGetUID: UIDPLUS success → APPENDUID = %d (parsed from string %q)", appendUID, v)
-				} else {
-					debugLog("appendGetUID: APPENDUID string parse failed: %v (value=%q)", err, v)
-				}
-			default:
-				debugLog("appendGetUID: APPENDUID code present but arg[1] is unexpected type (type=%T, value=%v)", raw, raw)
 			}
-		} else if status != nil {
-			debugLog("appendGetUID: no APPENDUID code received (code=%q, args=%d) — uid=0 (labels skipped if any)",
-				status.Code, len(status.Arguments))
-		} else {
-			debugLog("appendGetUID: status was nil — uid=0 (labels skipped if any)")
 		}
 
 		d.mu.Unlock()
@@ -526,7 +511,7 @@ func (d *DestClient) appendGetUID(ctx context.Context, label string, flags []str
 // labelJob is a single X-GM-LABELS STORE request.
 type labelJob struct {
 	mailbox string
-	uid	 uint32
+	uid     uint32
 	labels  []string
 	msgID   string // for logging only
 }
@@ -1127,8 +1112,8 @@ func buildReportEmail(destUser string, entries []*errorEntry, db *sql.DB) imap.L
 
 	// Always show permanently skipped messages so they stay visible every day.
 	type skippedRow struct {
-		key	   string
-		msgid	 string
+		key       string
+		msgid     string
 		failures  int
 		lastError string
 		skippedAt string
@@ -1150,10 +1135,10 @@ func buildReportEmail(destUser string, entries []*errorEntry, db *sql.DB) imap.L
 	if len(skipped) > 0 {
 		b.WriteString(fmt.Sprintf("⚠️  %d permanently skipped message(s) — action required:\r\n\r\n", len(skipped)))
 		for _, r := range skipped {
-			b.WriteString(fmt.Sprintf("  key:	   %s\r\n", r.key))
-			b.WriteString(fmt.Sprintf("  msg-id:	%s\r\n", r.msgid))
+			b.WriteString(fmt.Sprintf("  key:       %s\r\n", r.key))
+			b.WriteString(fmt.Sprintf("  msg-id:    %s\r\n", r.msgid))
 			b.WriteString(fmt.Sprintf("  skipped:   %s\r\n", r.skippedAt))
-			b.WriteString(fmt.Sprintf("  reason:	%s\r\n\r\n", r.lastError))
+			b.WriteString(fmt.Sprintf("  reason:    %s\r\n\r\n", r.lastError))
 		}
 		b.WriteString("To clear and retry all skipped messages:\r\n")
 		b.WriteString("  sqlite3 data/state.db \"DELETE FROM sync_failures;\"\r\n")
