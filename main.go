@@ -542,6 +542,9 @@ type labelJob struct {
 type LabelWorker struct {
 	conf DestConfig
 	jobs chan labelJob
+
+	mu sync.Mutex
+	c  *client.Client // guarded by mu; nil when not connected
 }
 
 // newLabelWorker creates a LabelWorker with a buffered queue of capacity cap.
@@ -556,6 +559,23 @@ func (lw *LabelWorker) Enqueue(mailbox string, uid uint32, labels []string, msgI
 	case lw.jobs <- labelJob{mailbox: mailbox, uid: uid, labels: labels, msgID: msgID}:
 	default:
 		errLog.add("label queue full — X-GM-LABELS dropped for msg %s → %q", msgID, mailbox)
+	}
+}
+
+// noop sends a NOOP on the label worker connection if it is currently open.
+// Called from the source sync loop to keep the connection alive between jobs.
+func (lw *LabelWorker) noop() {
+	lw.mu.Lock()
+	c := lw.c
+	lw.mu.Unlock()
+	if c == nil {
+		return
+	}
+	if err := c.Noop(); err != nil {
+		debugLog("label worker keepalive noop failed: %v — will reconnect on next job", err)
+		lw.mu.Lock()
+		lw.c = nil
+		lw.mu.Unlock()
 	}
 }
 
@@ -575,6 +595,9 @@ func (lw *LabelWorker) Run(ctx context.Context) {
 			)
 			if err == nil {
 				c = nc
+				lw.mu.Lock()
+				lw.c = nc
+				lw.mu.Unlock()
 				log.Printf("label worker connected: %s (%s)", lw.conf.Host, lw.conf.User)
 				return true
 			}
@@ -604,6 +627,9 @@ func (lw *LabelWorker) Run(ctx context.Context) {
 				errLog.add("label worker: select %q failed (attempt %d): %v", job.mailbox, attempt+1, err)
 				_ = c.Logout()
 				c = nil
+				lw.mu.Lock()
+				lw.c = nil
+				lw.mu.Unlock()
 				select {
 				case <-time.After(backoff(attempt)):
 				case <-ctx.Done():
@@ -624,6 +650,9 @@ func (lw *LabelWorker) Run(ctx context.Context) {
 					job.msgID, job.mailbox, attempt+1, err)
 				_ = c.Logout()
 				c = nil
+				lw.mu.Lock()
+				lw.c = nil
+				lw.mu.Unlock()
 				select {
 				case <-time.After(backoff(attempt)):
 				case <-ctx.Done():
@@ -651,6 +680,9 @@ func (lw *LabelWorker) Run(ctx context.Context) {
 			}
 			if c != nil {
 				_ = c.Logout()
+				lw.mu.Lock()
+				lw.c = nil
+				lw.mu.Unlock()
 			}
 			log.Println("label worker: stopped")
 			return
@@ -1027,6 +1059,22 @@ func runMappings(ctx context.Context, c *client.Client, src SourceConfig, dest *
 
 		if ctx.Err() != nil {
 			return true
+		}
+
+		// Keepalive: send NOOP on destination and label worker connections if
+		// they are already open. Prevents servers from closing idle connections
+		// between sync passes. Only sent when connected — never forces a dial.
+		dest.mu.Lock()
+		if dest.c != nil {
+			if err := dest.c.Noop(); err != nil {
+				debugLog("dest keepalive noop failed: %v — connection will redial on next append", err)
+				_ = dest.c.Logout()
+				dest.c = nil
+			}
+		}
+		dest.mu.Unlock()
+		if lw != nil {
+			lw.noop()
 		}
 
 		// Determine poll interval — default 600s (10 min).
