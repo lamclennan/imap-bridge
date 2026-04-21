@@ -422,88 +422,94 @@ func (d *DestClient) Append(ctx context.Context, label string, flags []string, r
 // Returns errDestDown only on connection-level failures (EOF, broken pipe,
 // auth failure, repeated reconnect failures) — not on server NO/BAD responses.
 func (d *DestClient) appendGetUID(ctx context.Context, label string, flags []string, r imap.Literal) (uid uint32, err error) {
-	connFails := 0
-	for attempt := 0; attempt < maxDestAttempts; attempt++ {
-		if ctx.Err() != nil {
-			return 0, ctx.Err()
-		}
+    connFails := 0
+    for attempt := 0; attempt < maxDestAttempts; attempt++ {
+        if ctx.Err() != nil {
+            return 0, ctx.Err()
+        }
 
-		d.mu.Lock()
-		connErr := d.ensureConn()
-		if connErr != nil {
-			d.mu.Unlock()
-			connFails++
-			wait := backoff(attempt)
-			errLog.add("dest connect error (attempt %d/%d): %v — retry in %s",
-				attempt+1, maxDestAttempts, connErr, wait)
-			select {
-			case <-time.After(wait):
-			case <-ctx.Done():
-				return 0, ctx.Err()
-			}
-			continue
-		}
+        d.mu.Lock()
+        connErr := d.ensureConn()
+        if connErr != nil {
+            d.mu.Unlock()
+            connFails++
+            wait := backoff(attempt)
+            errLog.add("dest connect error (attempt %d/%d): %v — retry in %s",
+                attempt+1, maxDestAttempts, connErr, wait)
+            select {
+            case <-time.After(wait):
+            case <-ctx.Done():
+                return 0, ctx.Err()
+            }
+            continue
+        }
 
-		cmd := &commands.Append{
-			Mailbox: label,
-			Flags:   flags,
-			Date:    time.Now(),
-			Message: r,
-		}
-		status, execErr := d.c.Execute(cmd, nil)
+        cmd := &commands.Append{
+            Mailbox: label,
+            Flags:   flags,
+            Date:    time.Now(),
+            Message: r,
+        }
+        status, execErr := d.c.Execute(cmd, nil)
 
-		if execErr != nil {
-			// Execute only returns non-nil err on network-level failures.
-			// These are always connection faults — mark conn dead and count.
-			_ = d.c.Logout()
-			d.c = nil
-			d.hasUIDPLUS = false
-			connFails++
-			d.mu.Unlock()
-			wait := backoff(attempt)
-			errLog.add("dest append error (attempt %d/%d): %v — retry in %s",
-				attempt+1, maxDestAttempts, execErr, wait)
-			select {
-			case <-time.After(wait):
-			case <-ctx.Done():
-				return 0, ctx.Err()
-			}
-			continue
-		}
+        if execErr != nil {
+            // Execute only returns non-nil err on network-level failures.
+            // These are always connection faults — mark conn dead and count.
+            _ = d.c.Logout()
+            d.c = nil
+            d.hasUIDPLUS = false
+            connFails++
+            d.mu.Unlock()
+            wait := backoff(attempt)
+            errLog.add("dest append error (attempt %d/%d): %v — retry in %s",
+                attempt+1, maxDestAttempts, execErr, wait)
+            select {
+            case <-time.After(wait):
+            case <-ctx.Done():
+                return 0, ctx.Err()
+            }
+            continue
+        }
 
-		// Execute returned nil err. Check status for server-level NO/BAD.
-		// These are message-level rejections — connection stays alive.
-		if status != nil && (status.Type == imap.StatusRespNo || status.Type == imap.StatusRespBad) {
-			d.mu.Unlock()
-			wait := backoff(attempt)
-			errLog.add("dest append rejected (attempt %d/%d): %s %s — retry in %s",
-				attempt+1, maxDestAttempts, status.Type, status.Info, wait)
-			select {
-			case <-time.After(wait):
-			case <-ctx.Done():
-				return 0, ctx.Err()
-			}
-			continue
-		}
+        // Execute returned nil err. Check status for server-level NO/BAD.
+        // These are message-level rejections — connection stays alive.
+        if status != nil && (status.Type == imap.StatusRespNo || status.Type == imap.StatusRespBad) {
+            d.mu.Unlock()
+            wait := backoff(attempt)
+            errLog.add("dest append rejected (attempt %d/%d): %s %s — retry in %s",
+                attempt+1, maxDestAttempts, status.Type, status.Info, wait)
+            select {
+            case <-time.After(wait):
+            case <-ctx.Done():
+                return 0, ctx.Err()
+            }
+            continue
+        }
 
-		// Append succeeded. Extract APPENDUID if UIDPLUS is supported.
-		appendUID := uint32(0)
-		if d.hasUIDPLUS && status != nil &&
-			strings.EqualFold(string(status.Code), "APPENDUID") &&
-			len(status.Arguments) >= 2 {
-			if v, ok := status.Arguments[1].(uint32); ok {
-				appendUID = v
-			}
-		}
+        // Append succeeded. Extract APPENDUID (removed hasUIDPLUS guard so Gmail always works).
+        appendUID := uint32(0)
+        if status != nil && strings.EqualFold(string(status.Code), "APPENDUID") && len(status.Arguments) >= 2 {
+            if v, ok := status.Arguments[1].(uint32); ok {
+                appendUID = v
+                debugLog("appendGetUID: UIDPLUS success → APPENDUID = %d", appendUID)
+            } else {
+                debugLog("appendGetUID: APPENDUID code present but arg[1] is not uint32 (type=%T, value=%v)", status.Arguments[1], status.Arguments[1])
+            }
+        } else if status != nil {
+            debugLog("appendGetUID: no APPENDUID code received (code=%q, args=%d) — uid=0 (labels skipped if any)",
+                status.Code, len(status.Arguments))
+        } else {
+            debugLog("appendGetUID: status was nil — uid=0 (labels skipped if any)")
+        }
 
-		d.mu.Unlock()
-		return appendUID, nil
-	}
+        d.mu.Unlock()
+        return appendUID, nil
+    }
 
-	if connFails == maxDestAttempts {
-		return 0, errDestDown
-	}
-	return 0, fmt.Errorf("dest: exhausted %d attempts appending to %q", maxDestAttempts, label)
+    if connFails == maxDestAttempts {
+        return 0, errDestDown
+    }
+    return 0, fmt.Errorf("dest: exhausted %d attempts appending to %q", maxDestAttempts, label)
 }
 
 // ---------- Gmail label worker ----------
