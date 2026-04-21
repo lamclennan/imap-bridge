@@ -77,7 +77,7 @@ cp config.example.json config.json
 }
 ```
 
-**Gmail accounts** — set `"provider": "gmail"` and omit `pass`:
+**Gmail accounts** — set `"provider": "gmail"` and omit `pass`. This applies equally to source and destination Gmail accounts; each account needs its own `credentials_file` and `token_file`, but accounts within the same Google Cloud project can share a `credentials_file`:
 
 ```json
 {
@@ -117,6 +117,14 @@ docker compose up -d
 docker logs -f imap-bridge
 ```
 
+On startup you will see a confirmation line for each successful connection, for example:
+
+```
+source connected: imap.gmail.com:993 (you@gmail.com)
+```
+
+A successful destination connection is confirmed the first time it delivers a message or on the initial folder-discovery pass. If credentials are wrong the bridge will log the error and retry with backoff.
+
 ---
 
 ## ⚙️ Config reference
@@ -126,7 +134,7 @@ docker logs -f imap-bridge
 | `debug` | top-level | `true` to enable verbose per-message logging; default `false` |
 | `host` | source / dest | `hostname:port` |
 | `user` | source / dest | IMAP username / email address |
-| `pass` | source / dest | Password or app password (omit for Gmail) |
+| `pass` | source / dest | Password or app password (omit for Gmail OAuth2) |
 | `security` | source / dest | `ssl` (port 993), `tls` (STARTTLS), `""` (plain) |
 | `skip_verify` | source / dest | Skip TLS cert check — dev/testing only |
 | `provider` | source / dest | `"gmail"` to use OAuth2 instead of password |
@@ -135,7 +143,7 @@ docker logs -f imap-bridge
 | `report_label` | dest only | Folder for daily error digest; empty = disabled |
 | `retention_days` | source only | `-1` = sync full history, never prune; `0` = keep forever (eligible for `sync_new_only`); `>0` = prune source messages older than N days |
 | `disable_idle` | source only | `true` to disable IMAP IDLE and use polling only; use when server IDLE is broken |
-| `poll_interval` | source only | Poll interval in seconds when IDLE is disabled or falls back; default `600` |
+| `poll_interval` | source only | Poll interval in seconds when IDLE is disabled or falls back; default `600` (10 minutes) |
 | `sync_new_only` | source only | On first run, skip all existing mail and only sync new messages arriving after startup. Only applies when `retention_days` is `0`. |
 | `max_error_retention_days` | source only | Stop retrying permanently skipped messages after N days; `0` = retry forever. Skipped messages appear in the daily report until expired or resolved. |
 | `mappings` | source only | `[{ "from": "...", "to": ["dest1", "dest2"], "labels": ["tag"] }]` — `to` is an array; `labels` is optional — see below |
@@ -149,7 +157,7 @@ The `to` field is an array — list as many destination folders as you need. The
 The optional `labels` array behaviour depends on the destination provider:
 
 - **Gmail** (`"provider": "gmail"`) — labels are applied via `X-GM-LABELS STORE` after each append, processed by a dedicated long-lived label connection. STOREs are queued and serialized; failures retry with the same backoff as the append connection and are logged to the daily digest. The message is always delivered even if the label store ultimately fails.
-- **Standard IMAP** (Dovecot, Courier etc.) — labels are set as IMAP keyword flags on the `APPEND` command itself. Server-dependent support.
+- **Standard IMAP** (Dovecot, Courier, OVH, cPanel, etc.) — labels are set as IMAP keyword flags on the `APPEND` command itself. Support is server-dependent; most modern servers accept keywords but they appear as flags rather than visible label folders. If your server does not support keywords the flags are silently ignored — message delivery is unaffected.
 
 ```json
 "mappings": [
@@ -262,9 +270,9 @@ Once you've identified the folder names, add your `mappings` and restart.
 
 ## ⚙️ How it works
 
-1. Connects to each source IMAP account (password or OAuth2)
+1. Connects to each source IMAP account (password or OAuth2); logs a confirmation line on success
 2. Tracks the last seen UID per folder in SQLite
-3. On new mail (IMAP IDLE or 10-minute poll), fetches new messages
+3. On new mail (IMAP IDLE or configurable poll interval), fetches new messages
 4. Mirrors `\Seen` flag from source — read mail stays read on the destination
 5. Appends to every destination folder listed in `to`; retries with backoff on failure
 6. If destination is Gmail and `labels` are configured, enqueues a `X-GM-LABELS STORE` to a dedicated long-lived label connection that serializes and retries label application independently of delivery

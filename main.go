@@ -379,6 +379,7 @@ func (d *DestClient) redial() error {
 		return err
 	}
 	d.c, d.oauthCfg, d.oauthTok = c, oCfg, oTok
+	log.Printf("destination connected: %s (%s)", cfg.Host, cfg.User)
 	// Detect UIDPLUS once per connection. Failure to query is treated as absent.
 	if ok, err := c.Support("UIDPLUS"); err == nil {
 		d.hasUIDPLUS = ok
@@ -574,6 +575,7 @@ func (lw *LabelWorker) Run(ctx context.Context) {
 			)
 			if err == nil {
 				c = nc
+				log.Printf("label worker connected: %s (%s)", lw.conf.Host, lw.conf.User)
 				return true
 			}
 			wait := backoff(attempt)
