@@ -141,10 +141,10 @@ A successful destination connection is confirmed the first time it delivers a me
 | `credentials_file` | source / dest | Path to Google OAuth2 `client_secret.json` |
 | `token_file` | source / dest | Path to cached OAuth2 token (unique per account) |
 | `report_label` | dest only | Folder for daily error digest; empty = disabled |
-| `retention_days` | source only | `-1` = sync full history, never prune; `0` = keep forever (eligible for `sync_new_only`); `>0` = prune source messages older than N days |
+| `retention_days` | source only | `-1` = sync full history, never prune (eligible for `sync_new_only`); `0` = keep forever (eligible for `sync_new_only`); `>0` = prune source messages older than N days |
 | `disable_idle` | source only | `true` to disable IMAP IDLE and use polling only; use when server IDLE is broken |
 | `poll_interval` | source only | Poll interval in seconds when IDLE is disabled or falls back; default `600` (10 minutes) |
-| `sync_new_only` | source only | On first run, skip all existing mail and only sync new messages arriving after startup. Only applies when `retention_days` is `0`. |
+| `sync_new_only` | source only | On first run, skip all existing mail and only sync new messages arriving after startup. Only applies when `retention_days` is `0` or `-1`. |
 | `max_error_retention_days` | source only | Stop retrying permanently skipped messages after N days; `0` = retry forever. Skipped messages appear in the daily report until expired or resolved. |
 | `mappings` | source only | `[{ "from": "...", "to": ["dest1", "dest2"], "labels": ["tag"] }]` — `to` is an array; `labels` is optional — see below |
 

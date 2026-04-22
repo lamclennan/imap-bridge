@@ -187,6 +187,17 @@ func cacheAdd(id string) {
 	cacheMux.Unlock()
 }
 
+// cacheEvict removes all entries older than cacheTTL. Run once a day.
+func cacheEvict() {
+	cacheMux.Lock()
+	defer cacheMux.Unlock()
+	for id, e := range msgCache {
+		if time.Since(e.ts) >= cacheTTL {
+			delete(msgCache, id)
+		}
+	}
+}
+
 // ---------- DB ----------
 
 func initDB(path string) *sql.DB {
@@ -269,6 +280,7 @@ func loadOAuthToken(credFile, tokenFile string) (*oauth2.Token, *oauth2.Config, 
 	if data, err := json.Marshal(tok); err == nil {
 		_ = os.WriteFile(tokenFile, data, 0600)
 	}
+	log.Printf("OAuth2 authorisation successful — token saved to %s", tokenFile)
 	return tok, cfg, nil
 }
 
@@ -361,7 +373,8 @@ type DestClient struct {
 	c          *client.Client
 	oauthCfg   *oauth2.Config
 	oauthTok   *oauth2.Token
-	hasUIDPLUS bool // cached per connection; set during redial
+	hasUIDPLUS bool        // cached per connection; set during redial
+	lastNoopAt time.Time   // guards keepalive rate across all source goroutines
 }
 
 func (d *DestClient) redial() error {
@@ -748,9 +761,9 @@ func syncFolder(ctx context.Context, c *client.Client, dest *DestClient, lw *Lab
 	_ = db.QueryRow("SELECT last_uid FROM folder_offsets WHERE account_folder = ?", key).Scan(&lastUID)
 
 	// First run with sync_new_only: skip all existing mail by initialising the
-	// offset to the current highest UID. Only applies when retention_days=0 —
-	// with retention enabled (>0 or -1) you want historical mail.
-	if lastUID == 0 && syncNewOnly && retentionDays == 0 {
+	// offset to the current highest UID. Only applies when retention_days <= 0 —
+	// with positive retention you want historical mail within the window.
+	if lastUID == 0 && syncNewOnly && retentionDays <= 0 {
 		if status, err := c.Status(folder, []imap.StatusItem{imap.StatusUidNext}); err == nil && status.UidNext > 1 {
 			lastUID = status.UidNext - 1
 			_, _ = db.Exec("INSERT OR REPLACE INTO folder_offsets VALUES (?, ?)", key, lastUID)
@@ -1035,6 +1048,8 @@ func monitorSource(ctx context.Context, src SourceConfig, dest *DestClient, lw *
 func runMappings(ctx context.Context, c *client.Client, src SourceConfig, dest *DestClient, lw *LabelWorker, db *sql.DB) (cleanExit bool) {
 	defer c.Logout()
 
+	const keepaliveInterval = 3 * time.Minute
+
 	for {
 		// Sync every mapping in sequence.
 		for _, m := range src.Mappings {
@@ -1061,20 +1076,25 @@ func runMappings(ctx context.Context, c *client.Client, src SourceConfig, dest *
 			return true
 		}
 
-		// Keepalive: send NOOP on destination and label worker connections if
-		// they are already open. Prevents servers from closing idle connections
-		// between sync passes. Only sent when connected — never forces a dial.
+		// Keepalive: send NOOP on destination and label worker if already open,
+		// but no more than once every 3 minutes globally across all sources.
+		// lastNoopAt is on DestClient so the rate limit is shared.
 		dest.mu.Lock()
-		if dest.c != nil {
-			if err := dest.c.Noop(); err != nil {
-				debugLog("dest keepalive noop failed: %v — connection will redial on next append", err)
-				_ = dest.c.Logout()
-				dest.c = nil
+		if time.Since(dest.lastNoopAt) >= keepaliveInterval {
+			if dest.c != nil {
+				if err := dest.c.Noop(); err != nil {
+					debugLog("dest keepalive noop failed: %v — connection will redial on next append", err)
+					_ = dest.c.Logout()
+					dest.c = nil
+				}
 			}
-		}
-		dest.mu.Unlock()
-		if lw != nil {
-			lw.noop()
+			dest.lastNoopAt = time.Now()
+			dest.mu.Unlock()
+			if lw != nil {
+				lw.noop()
+			}
+		} else {
+			dest.mu.Unlock()
 		}
 
 		// Determine poll interval — default 600s (10 min).
@@ -1287,6 +1307,30 @@ func resetDailyRetries(db *sql.DB, sources []SourceConfig) {
 	}
 	// Reset skipped_at on all remaining records so they are retried today.
 	_, _ = db.Exec(`UPDATE sync_failures SET skipped_at = NULL WHERE skipped_at IS NOT NULL`)
+
+	// Prune sync_state rows by age. The dedup key format is "message-id\x00dest-folder"
+	// with no source prefix, so pruning must be global. Use the longest retention
+	// window across all sources — max(retention_days, max_error_retention_days) + 1,
+	// minimum 7 days — so no source loses dedup coverage prematurely.
+	const defaultSyncStateRetention = 7
+	window := defaultSyncStateRetention
+	for _, src := range sources {
+		a := src.RetentionDays
+		if a < 0 {
+			a = 0 // -1 means sync all history, not relevant to dedup window
+		}
+		b := src.MaxErrorRetentionDays
+		candidate := a
+		if b > candidate {
+			candidate = b
+		}
+		candidate++ // +1 as buffer
+		if candidate > window {
+			window = candidate
+		}
+	}
+	_, _ = db.Exec(`DELETE FROM sync_state
+		WHERE julianday('now') - julianday(created_at) > ?`, window)
 }
 // runReporter fires at 07:00 local time each day, resets skipped message retry
 // flags, drains the error buffer, and appends a digest email to report_label.
@@ -1425,6 +1469,22 @@ func main() {
 			lw.Run(ctx)
 		}()
 	}
+
+	// Sweep expired entries from the in-memory dedup cache once a day.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		t := time.NewTicker(cacheTTL)
+		defer t.Stop()
+		for {
+			select {
+			case <-t.C:
+				cacheEvict()
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
 
 	wg.Add(1)
 	go func() {
