@@ -1,6 +1,7 @@
 services:
   imap-bridge:
     build: .
+    image: ghcr.io/lamclennan/imap-bridge:latest
     container_name: imap-bridge
     restart: unless-stopped
 
@@ -31,3 +32,4 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+

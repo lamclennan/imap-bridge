@@ -13,10 +13,10 @@ COPY . .
 RUN CGO_ENABLED=1 go build -ldflags="-s -w" -o bridge main.go
 
 # ---------- Runtime Stage ----------
-FROM alpine:3.20
+FROM alpine:3.21
 
 RUN apk add --no-cache ca-certificates sqlite && \
-    adduser -D -h /app appuser
+    adduser -D -u 1000 -h /app appuser
 
 WORKDIR /app
 
@@ -26,7 +26,11 @@ COPY --from=builder /app/bridge .
 # config.json    — mounted at runtime via docker-compose volume
 # keys/          — OAuth2 client_secret files (one per Gmail project), read-only
 # tokens/        — OAuth2 token cache (one file per account), writable
-RUN mkdir -p /app/data /app/keys /app/tokens && chown -R appuser:appuser /app
+# Directories are created and owned by appuser (UID 1000) so that host-mounted
+# volumes work without permission errors. On the host, run:
+#   mkdir -p data tokens keys && chown -R 1000:1000 data tokens keys
+RUN mkdir -p /app/data /app/keys /app/tokens && \
+    chown -R appuser:appuser /app
 
 USER appuser
 

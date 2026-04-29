@@ -1,53 +1,49 @@
 {
   "debug": false,
 
+  "sync": {
+    "max_dest_attempts":       8,
+    "max_msg_attempts":        5,
+    "dedup_cache_ttl_hours":   24,
+    "backoff_base_seconds":    1,
+    "backoff_max_seconds":     60,
+    "daily_retry_hour":        7,
+    "max_error_retention_days": 0
+  },
+
   "destination": {
-    "host":             "imap.gmail.com:993",
-    "user":             "archive@gmail.com",
-    "security":         "ssl",
-    "provider":         "gmail",
-    "credentials_file": "keys/client_secret.json",
-    "token_file":       "tokens/token_dest.json",
-    "report_label":     "00Reports",
-    "skip_verify":      false
+    "host":         "imap.gmail.com:993",
+    "user":         "archive@gmail.com",
+    "security":     "ssl",
+    "provider":     "gmail",
+    "credentials_file": "keys/client_secret_archive.json",
+    "token_file":   "tokens/token_archive.json",
+    "report_label": "Bridge/Reports"
   },
 
   "sources": [
     {
-      "_note":                   "Standard IMAP — IDLE disabled, 5-min poll, skip existing mail on first run",
-      "host":                    "mail.example.com:993",
-      "user":                    "user@example.com",
-      "pass":                    "app-password-here",
-      "security":                "ssl",
-      "skip_verify":             false,
-      "retention_days":          -1,
-      "disable_idle":            true,
-      "poll_interval":           300,
-      "sync_new_only":           true,
-      "max_error_retention_days": 30,
+      "host":         "imap-mail.outlook.com:993",
+      "user":         "you@outlook.com",
+      "pass":         "app-password-here",
+      "security":     "ssl",
+      "retention_days": 0,
+      "sync_new_only": true,
       "mappings": [
-        { "from": "INBOX",      "to": ["INBOX"],                  "labels": ["example"] },
-        { "from": "INBOX/Sent", "to": ["[Gmail]/Sent Mail"]                              },
-        { "from": "INBOX/Work", "to": ["INBOX", "Bridged/Work"],  "labels": ["work"]    }
+        { "from": "INBOX", "to": ["INBOX"] }
       ]
     },
     {
-      "_note":                   "Gmail source — IDLE enabled, 90-day retention",
-      "host":                    "imap.gmail.com:993",
-      "user":                    "you@gmail.com",
-      "security":                "ssl",
-      "provider":                "gmail",
-      "credentials_file":        "keys/client_secret.json",
-      "token_file":              "tokens/token_src_you.json",
-      "skip_verify":             false,
-      "retention_days":          90,
-      "disable_idle":            false,
-      "sync_new_only":           false,
-      "max_error_retention_days": 30,
+      "host":         "imap.gmail.com:993",
+      "user":         "another@gmail.com",
+      "security":     "ssl",
+      "provider":     "gmail",
+      "credentials_file": "keys/client_secret_another.json",
+      "token_file":   "tokens/token_another.json",
+      "retention_days": -1,
+      "sync_new_only": true,
       "mappings": [
-        { "from": "INBOX",             "to": ["INBOX"]             },
-        { "from": "[Gmail]/Sent Mail", "to": ["[Gmail]/Sent Mail"] },
-        { "from": "[Gmail]/All Mail",  "to": ["[Gmail]/All Mail"]  }
+        { "from": "INBOX", "to": ["INBOX"] }
       ]
     }
   ]

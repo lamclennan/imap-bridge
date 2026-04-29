@@ -1,0 +1,34 @@
+[Unit]
+Description=IMAP Bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=imap-bridge
+Group=imap-bridge
+WorkingDirectory=/opt/imap-bridge
+ExecStart=/usr/local/bin/imap-bridge
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=30
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=imap-bridge
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/imap-bridge/data /opt/imap-bridge/tokens
+ReadOnlyPaths=/opt/imap-bridge/keys
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

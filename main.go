@@ -44,6 +44,18 @@ type Config struct {
 	Destination DestConfig     `json:"destination"`
 	Sources     []SourceConfig `json:"sources"`
 	Debug       bool           `json:"debug"` // enable verbose per-message logging
+	Sync        SyncConfig     `json:"sync"`  // optional tuning; all fields have safe defaults
+}
+
+// SyncConfig holds global tuning knobs with safe defaults applied in main().
+type SyncConfig struct {
+	MaxDestAttempts      int `json:"max_dest_attempts"`       // append retry limit; default 8
+	MaxMsgAttempts       int `json:"max_msg_attempts"`        // per-message failure limit before skip; default 5
+	DedupCacheTTLHours   int `json:"dedup_cache_ttl_hours"`   // in-memory dedup cache TTL; default 24
+	BackoffBaseSeconds   int `json:"backoff_base_seconds"`    // backoff base multiplier in seconds; default 1
+	BackoffMaxSeconds    int `json:"backoff_max_seconds"`     // backoff ceiling in seconds; default 60
+	DailyRetryHour       int `json:"daily_retry_hour"`        // hour (0-23) for daily digest and retry reset; default 7
+	MaxErrorRetentionDays int `json:"max_error_retention_days"` // global default for sources that don't specify; default 0 (forever)
 }
 
 type DestConfig struct {
@@ -166,7 +178,7 @@ type cacheEntry struct {
 var (
 	msgCache = make(map[string]cacheEntry)
 	cacheMux sync.Mutex
-	cacheTTL = 24 * time.Hour
+	cacheTTL = 24 * time.Hour // overridden from SyncConfig.DedupCacheTTLHours in main()
 )
 
 func cacheSeen(id string) bool {
@@ -229,6 +241,12 @@ func initDB(path string) *sql.DB {
 
 // ---------- Backoff ----------
 
+// backoffBase and backoffMax are set from SyncConfig in main().
+var (
+	backoffBase = time.Second
+	backoffMax  = 60 * time.Second
+)
+
 func backoff(attempt int) time.Duration {
 	if attempt < 0 {
 		attempt = 0
@@ -236,10 +254,10 @@ func backoff(attempt int) time.Duration {
 	if attempt > 10 {
 		attempt = 10
 	}
-	base := time.Second * time.Duration(1<<attempt)
+	base := backoffBase * time.Duration(1<<attempt)
 	jitter := time.Duration(mrand.Intn(1000)) * time.Millisecond
-	if base > time.Minute {
-		base = time.Minute
+	if base > backoffMax {
+		base = backoffMax
 	}
 	return base + jitter
 }
@@ -357,12 +375,11 @@ func connectAndLogin(
 
 // ---------- Destination client ----------
 
-const maxDestAttempts = 8
-
-// maxMsgAttempts is the number of consecutive sync failures before a message
-// is permanently skipped. Prevents a single poison message from blocking all
-// subsequent mail in the same folder.
-const maxMsgAttempts = 5
+// maxDestAttempts and maxMsgAttempts are set from SyncConfig in main().
+var (
+	maxDestAttempts = 8
+	maxMsgAttempts  = 5
+)
 
 // DestClient is a single shared, thread-safe IMAP append connection with
 // automatic reconnection. All source workers and the reporter use the same instance.
@@ -1252,9 +1269,9 @@ func buildReportEmail(destUser string, entries []*errorEntry, db *sql.DB) imap.L
 	return bytes.NewReader([]byte(b.String()))
 }
 
-func nextReportTime() time.Time {
+func nextReportTime(hour int) time.Time {
 	now := time.Now()
-	t := time.Date(now.Year(), now.Month(), now.Day(), 7, 0, 0, 0, now.Location())
+	t := time.Date(now.Year(), now.Month(), now.Day(), hour, 0, 0, 0, now.Location())
 	if now.After(t) {
 		t = t.Add(24 * time.Hour)
 	}
@@ -1265,10 +1282,15 @@ func nextReportTime() time.Time {
 // are retried on the next sync pass. Records older than maxDays (per source
 // config) are deleted entirely and their folder offset is advanced past them
 // so they are not found again.
-func resetDailyRetries(db *sql.DB, sources []SourceConfig) {
+func resetDailyRetries(db *sql.DB, sources []SourceConfig, globalMaxErrorDays int) {
 	// Expire records that have exceeded their source's max_error_retention_days.
+	// Sources that don't specify it fall back to the global default.
 	for _, src := range sources {
-		if src.MaxErrorRetentionDays <= 0 {
+		maxDays := src.MaxErrorRetentionDays
+		if maxDays <= 0 {
+			maxDays = globalMaxErrorDays
+		}
+		if maxDays <= 0 {
 			continue
 		}
 		prefix := src.User + ":"
@@ -1276,7 +1298,7 @@ func resetDailyRetries(db *sql.DB, sources []SourceConfig) {
 		rows, err := db.Query(`SELECT key FROM sync_failures
 			WHERE key LIKE ? AND skipped_at IS NOT NULL
 			AND julianday('now') - julianday(skipped_at) > ?`,
-			prefix+"%", src.MaxErrorRetentionDays)
+			prefix+"%", maxDays)
 		if err == nil {
 			for rows.Next() {
 				var key string
@@ -1303,7 +1325,7 @@ func resetDailyRetries(db *sql.DB, sources []SourceConfig) {
 		_, _ = db.Exec(`DELETE FROM sync_failures
 			WHERE key LIKE ? AND skipped_at IS NOT NULL
 			AND julianday('now') - julianday(skipped_at) > ?`,
-			prefix+"%", src.MaxErrorRetentionDays)
+			prefix+"%", maxDays)
 	}
 	// Reset skipped_at on all remaining records so they are retried today.
 	_, _ = db.Exec(`UPDATE sync_failures SET skipped_at = NULL WHERE skipped_at IS NOT NULL`)
@@ -1332,19 +1354,19 @@ func resetDailyRetries(db *sql.DB, sources []SourceConfig) {
 	_, _ = db.Exec(`DELETE FROM sync_state
 		WHERE julianday('now') - julianday(created_at) > ?`, window)
 }
-// runReporter fires at 07:00 local time each day, resets skipped message retry
+// runReporter fires at the configured daily_retry_hour each day, resets skipped message retry
 // flags, drains the error buffer, and appends a digest email to report_label.
 // Disabled if report_label is empty.
-func runReporter(ctx context.Context, dest *DestClient, destConf DestConfig, db *sql.DB, sources []SourceConfig) {
+func runReporter(ctx context.Context, dest *DestClient, destConf DestConfig, db *sql.DB, sources []SourceConfig, dailyHour int, globalMaxErrorDays int) {
 	if destConf.ReportLabel == "" {
 		log.Println("report_label not configured — daily report disabled")
 		return
 	}
 
-	log.Printf("daily report enabled → %q at 07:00 local", destConf.ReportLabel)
+	log.Printf("daily report enabled → %q at %02d:00 local", destConf.ReportLabel, dailyHour)
 
 	for {
-		next := nextReportTime()
+		next := nextReportTime(dailyHour)
 		log.Printf("next report scheduled: %s", next.Format("2006-01-02 15:04:05"))
 
 		select {
@@ -1355,7 +1377,7 @@ func runReporter(ctx context.Context, dest *DestClient, destConf DestConfig, db 
 
 		// Expire old failures and reset skipped_at so messages are retried today.
 		// Report is built after reset so it reflects what will be retried.
-		resetDailyRetries(db, sources)
+		resetDailyRetries(db, sources, globalMaxErrorDays)
 
 		entries := errLog.drain()
 		msg := buildReportEmail(destConf.User, entries, db)
@@ -1419,6 +1441,99 @@ func main() {
 	debugEnabled = conf.Debug
 	if debugEnabled {
 		log.Println("debug logging enabled")
+	}
+
+	// Apply SyncConfig defaults for any fields left at zero.
+	if conf.Sync.MaxDestAttempts <= 0 {
+		conf.Sync.MaxDestAttempts = 8
+	}
+	if conf.Sync.MaxMsgAttempts <= 0 {
+		conf.Sync.MaxMsgAttempts = 5
+	}
+	if conf.Sync.DedupCacheTTLHours <= 0 {
+		conf.Sync.DedupCacheTTLHours = 24
+	}
+	if conf.Sync.BackoffBaseSeconds <= 0 {
+		conf.Sync.BackoffBaseSeconds = 1
+	}
+	if conf.Sync.BackoffMaxSeconds <= 0 {
+		conf.Sync.BackoffMaxSeconds = 60
+	}
+	if conf.Sync.DailyRetryHour < 0 || conf.Sync.DailyRetryHour > 23 {
+		conf.Sync.DailyRetryHour = 7
+	}
+
+	// Wire SyncConfig values into package-level vars used throughout.
+	maxDestAttempts = conf.Sync.MaxDestAttempts
+	maxMsgAttempts  = conf.Sync.MaxMsgAttempts
+	cacheTTL        = time.Duration(conf.Sync.DedupCacheTTLHours) * time.Hour
+	backoffBase     = time.Duration(conf.Sync.BackoffBaseSeconds) * time.Second
+	backoffMax      = time.Duration(conf.Sync.BackoffMaxSeconds) * time.Second
+
+	// ---------- Config validation ----------
+	var cfgErrs []string
+
+	if conf.Destination.Host == "" {
+		cfgErrs = append(cfgErrs, "destination.host is required")
+	}
+	if conf.Destination.User == "" {
+		cfgErrs = append(cfgErrs, "destination.user is required")
+	}
+	destIsGmail := strings.ToLower(conf.Destination.Provider) == "gmail"
+	if destIsGmail {
+		if conf.Destination.CredentialsFile == "" {
+			cfgErrs = append(cfgErrs, "destination.credentials_file is required when provider=gmail")
+		}
+		if conf.Destination.TokenFile == "" {
+			cfgErrs = append(cfgErrs, "destination.token_file is required when provider=gmail")
+		}
+	} else if conf.Destination.Pass == "" {
+		cfgErrs = append(cfgErrs, "destination.pass is required for non-Gmail destinations")
+	}
+	validSecurity := map[string]bool{"ssl": true, "tls": true, "": true}
+	if !validSecurity[strings.ToLower(conf.Destination.Security)] {
+		cfgErrs = append(cfgErrs, fmt.Sprintf("destination.security %q is invalid — use ssl, tls, or omit for plain", conf.Destination.Security))
+	}
+	if len(conf.Sources) == 0 {
+		cfgErrs = append(cfgErrs, "at least one source is required")
+	}
+	for i, src := range conf.Sources {
+		prefix := fmt.Sprintf("sources[%d] (%s)", i, src.User)
+		if src.Host == "" {
+			cfgErrs = append(cfgErrs, prefix+": host is required")
+		}
+		if src.User == "" {
+			cfgErrs = append(cfgErrs, fmt.Sprintf("sources[%d]: user is required", i))
+		}
+		srcIsGmail := strings.ToLower(src.Provider) == "gmail"
+		if srcIsGmail {
+			if src.CredentialsFile == "" {
+				cfgErrs = append(cfgErrs, prefix+": credentials_file is required when provider=gmail")
+			}
+			if src.TokenFile == "" {
+				cfgErrs = append(cfgErrs, prefix+": token_file is required when provider=gmail")
+			}
+		} else if src.Pass == "" {
+			cfgErrs = append(cfgErrs, prefix+": pass is required for non-Gmail sources")
+		}
+		if !validSecurity[strings.ToLower(src.Security)] {
+			cfgErrs = append(cfgErrs, fmt.Sprintf("%s: security %q is invalid — use ssl, tls, or omit for plain", prefix, src.Security))
+		}
+		for j, m := range src.Mappings {
+			if m.From == "" {
+				cfgErrs = append(cfgErrs, fmt.Sprintf("%s: mappings[%d].from is required", prefix, j))
+			}
+			if len(m.To) == 0 {
+				cfgErrs = append(cfgErrs, fmt.Sprintf("%s: mappings[%d].to must have at least one destination", prefix, j))
+			}
+		}
+	}
+	if len(cfgErrs) > 0 {
+		log.Println("config validation failed:")
+		for _, e := range cfgErrs {
+			log.Println(" •", e)
+		}
+		os.Exit(1)
 	}
 
 	// Folder discovery: if any source has no mappings, log both that source's
@@ -1489,7 +1604,7 @@ func main() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		runReporter(ctx, dest, conf.Destination, db, conf.Sources)
+		runReporter(ctx, dest, conf.Destination, db, conf.Sources, conf.Sync.DailyRetryHour, conf.Sync.MaxErrorRetentionDays)
 	}()
 
 	for _, src := range conf.Sources {

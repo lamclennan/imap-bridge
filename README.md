@@ -33,6 +33,11 @@ cd imap-bridge
 mkdir -p data tokens keys
 ```
 
+> **Docker users** — the container runs as UID 1000. Set ownership on these directories before starting so mounted volumes are writable:
+> ```bash
+> chown -R 1000:1000 data tokens keys
+> ```
+
 ### 2. Configure
 
 ```bash
@@ -128,6 +133,22 @@ A successful destination connection is confirmed the first time it delivers a me
 ---
 
 ## ⚙️ Config reference
+
+### `sync` (optional global tuning)
+
+All fields have safe defaults — omit the entire `sync` block for standard behaviour.
+
+| Field | Default | Description |
+|---|---|---|
+| `max_dest_attempts` | `8` | Append retry limit per message before giving up |
+| `max_msg_attempts` | `5` | Consecutive failures before a message is permanently skipped |
+| `dedup_cache_ttl_hours` | `24` | In-memory dedup cache TTL in hours |
+| `backoff_base_seconds` | `1` | Backoff base multiplier in seconds |
+| `backoff_max_seconds` | `60` | Backoff ceiling in seconds |
+| `daily_retry_hour` | `7` | Hour (0–23, local time) for daily digest and retry reset |
+| `max_error_retention_days` | `0` | Global default for sources that don't specify their own; `0` = retry forever |
+
+### Source and destination fields
 
 | Field | Scope | Description |
 |---|---|---|
@@ -288,7 +309,120 @@ Once you've identified the folder names, add your `mappings` and restart.
 * `./keys/` mounted read-only — place all `client_secret_*.json` files here
 * `./tokens/` mounted writable — one token file per Gmail account, auto-refreshed
 * Log rotation: 10 MB × 3 files
-* Non-root user inside container
+* Non-root user inside container (UID 1000) — host directories must be owned by UID 1000
+
+---
+
+## 🔨 Building from source
+
+### Option A — compile locally
+
+Requires Go 1.22+ and gcc (for CGO/SQLite).
+
+```bash
+CGO_ENABLED=1 go build -ldflags="-s -w" -o imap-bridge main.go
+```
+
+### Option B — compile inside Docker (no local Go required)
+
+Use this if your system has an older Go version or you want a clean reproducible build. The binary is compiled inside the Go 1.26 builder container and exported to your working directory:
+
+```bash
+docker build --target builder -t imap-bridge-builder .
+docker run --rm -v "$(pwd)":/out imap-bridge-builder \
+  cp /app/bridge /out/imap-bridge
+```
+
+The resulting `imap-bridge` binary is statically linked against musl libc (Alpine-based) and runs on any Linux x86_64 system. For ARM64 (Raspberry Pi, Apple Silicon, etc.) add `--platform linux/arm64` to both commands.
+
+> **Note:** The binary is built against musl libc from Alpine. On glibc-based systems (Debian, Ubuntu, RHEL) it will run without issues as a fully self-contained static binary.
+
+### Running the binary directly
+
+Place the binary and your config in a working directory:
+
+```bash
+mkdir -p /opt/imap-bridge/{data,keys,tokens}
+cp imap-bridge /usr/local/bin/imap-bridge
+cp config.json /opt/imap-bridge/
+# copy keys and run OAuth first-run from the working directory:
+cd /opt/imap-bridge && imap-bridge
+```
+
+---
+
+## 🖥️ Running as a systemd service
+
+For production use on a Linux server without Docker.
+
+### 1. Create a dedicated user and directory
+
+```bash
+useradd -r -s /sbin/nologin -d /opt/imap-bridge imap-bridge
+mkdir -p /opt/imap-bridge/{data,keys,tokens}
+cp config.json /opt/imap-bridge/
+cp -r keys/* /opt/imap-bridge/keys/
+chown -R imap-bridge:imap-bridge /opt/imap-bridge
+chmod 600 /opt/imap-bridge/keys/*
+```
+
+### 2. Install the binary
+
+```bash
+cp imap-bridge /usr/local/bin/imap-bridge
+chmod 755 /usr/local/bin/imap-bridge
+```
+
+### 3. Gmail OAuth2 first-run (if applicable)
+
+OAuth2 requires an interactive terminal the first time. Run as the service user before enabling the service:
+
+```bash
+sudo -u imap-bridge bash -c "cd /opt/imap-bridge && /usr/local/bin/imap-bridge"
+# Complete the OAuth flow, then Ctrl+C
+```
+
+Token files are written to `/opt/imap-bridge/tokens/` and refresh automatically thereafter.
+
+### 4. Install and enable the service
+
+Copy the included `imap-bridge.service` file:
+
+```bash
+cp imap-bridge.service /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable imap-bridge
+systemctl start imap-bridge
+```
+
+### 5. Check status and logs
+
+```bash
+systemctl status imap-bridge
+journalctl -u imap-bridge -f
+```
+
+The service restarts automatically on failure with a 10-second delay. On `systemctl stop` it sends SIGTERM and waits up to 30 seconds for a clean shutdown, allowing the label worker to drain any queued label jobs.
+
+---
+
+## 🚀 Docker Registry
+
+Pre-built images for `linux/amd64` and `linux/arm64` are published automatically on each release tag:
+
+```bash
+docker pull ghcr.io/lamclennan/imap-bridge:latest
+# or pin to a specific version:
+docker pull ghcr.io/lamclennan/imap-bridge:v1.0.1
+```
+
+Update `docker-compose.yml` to use the published image instead of building locally:
+
+```yaml
+services:
+  imap-bridge:
+    image: ghcr.io/lamclennan/imap-bridge:latest
+```
 
 ---
 
